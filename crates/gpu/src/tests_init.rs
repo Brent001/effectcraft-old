@@ -177,3 +177,21 @@ fn fxc_builds_classic3d_and_initialization_errors_stay_scoped() {
     let _invalid = invalid_module(&device);
     assert_eq!(host.load(Ordering::SeqCst), 1);
 }
+
+/// #613 diagnostics: lists every kernel the DirectX 12 shader compiler rejects, with its error.
+/// `WGPU_DX12_COMPILER` picks the compiler (`fxc` by default here; `dxc` loads `dxcompiler.dll`).
+/// Ignored by default (slow). Skips where there is no DirectX 12 adapter.
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "slow: compiles every kernel"]
+fn dx12_kernel_report() {
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = wgpu::Backends::DX12;
+    desc.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc.with_env();
+    let Some((adapter, device, queue)) = native_device(desc, false) else { return };
+    let ctx = GpuContext::new(&adapter, device, queue).expect("compositor starts on DirectX 12");
+    for (entry, why) in ctx.unavailable_kernels() {
+        println!("UNAVAILABLE {entry}: {why}");
+    }
+    println!("UNAVAILABLE COUNT {}", ctx.unavailable_kernels().len());
+}
