@@ -204,3 +204,7 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# EffectCraft patch (#613): wgpu-hal 30.0.1 + DXC IEEE strictness (-Gis); drop once upstream has it.
+[patch.crates-io]
+wgpu-hal = { path = "third_party/wgpu-hal" }
