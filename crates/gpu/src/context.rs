@@ -784,6 +784,8 @@ impl GpuContext {
             // Match eframe's backend override so CLI and headless acceptance tests
             // exercise the backend requested for the native viewer.
             desc.backends = wgpu::Backends::from_env().unwrap_or(desc.backends);
+            // WGPU_VALIDATION / WGPU_DEBUG etc. (the D3D12 debug layer, Vulkan validation).
+            desc.flags = desc.flags.with_env();
         }
         #[cfg(target_arch = "wasm32")]
         {
