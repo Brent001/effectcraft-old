@@ -577,7 +577,15 @@ impl crate::CommandEncoder for super::CommandEncoder {
                         }
                     }
                 }
-            } else if barrier.usage.from == wgt::TextureUses::STORAGE_READ_WRITE {
+            } else if barrier.usage.from.intersects(
+                // EffectCraft patch (#613): upstream emits a UAV barrier only after
+                // STORAGE_READ_WRITE, so two dispatches writing one write-only storage texture
+                // in a row (wgpu-core asks for a barrier there) could overlap and the earlier
+                // write land last.
+                wgt::TextureUses::STORAGE_READ_WRITE
+                    | wgt::TextureUses::STORAGE_WRITE_ONLY
+                    | wgt::TextureUses::STORAGE_ATOMIC,
+            ) {
                 let raw = Direct3D12::D3D12_RESOURCE_BARRIER {
                     Type: Direct3D12::D3D12_RESOURCE_BARRIER_TYPE_UAV,
                     Flags: Direct3D12::D3D12_RESOURCE_BARRIER_FLAG_NONE,
