@@ -370,7 +370,8 @@ fn use_dx12_for_affected_intel() -> bool {
     let mut descriptor = eframe::wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = eframe::wgpu::Backends::DX12;
     let instance = eframe::wgpu::Instance::new(descriptor);
-    let found = instance.enumerate_adapters(eframe::wgpu::Backends::DX12).iter().any(|adapter| {
+    let adapters = pollster::block_on(instance.enumerate_adapters(eframe::wgpu::Backends::DX12));
+    let found = adapters.iter().any(|adapter| {
         let info = adapter.get_info();
         info.vendor == 0x8086
             && info.device_type == eframe::wgpu::DeviceType::IntegratedGpu
