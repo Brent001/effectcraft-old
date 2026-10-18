@@ -1171,7 +1171,7 @@ pub fn pages() -> Vec<Page> {
                 s("startup.offerCrashRecovery", "Offer to Open the Latest Auto-Save After a Crash", B, true),
                 s("startup.windowGraphics", "Window Graphics", Kind::Choice(WINDOW_GRAPHICS), true),
                 Note(
-                    "Window Graphics applies from the next launch. If graphics initialization hangs before the window appears, EffectCraft tries Vulkan and then OpenGL. OpenGL restores the window but disables the GPU compositor.",
+                    "Window Graphics applies from the next launch. If the selected backend hangs before the window appears, startup recovery tries another backend. Vulkan is used after DX12 when possible; OpenGL is the last resort and disables the GPU compositor.",
                 ),
                 Section("Repair"),
                 Button { label: "Reset Settings", command: "prefs.reset", params: "{}" },
