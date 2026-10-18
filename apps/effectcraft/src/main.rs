@@ -286,7 +286,9 @@ fn main() -> eframe::Result {
     let startup_preference = configured_window_graphics(startup_config_dir.as_deref());
     #[cfg(target_os = "windows")]
     let migration_pending = startup_config_dir.as_deref().is_some_and(|path| {
-        !path.join("dx12-gl-repair-attempted").exists() && !path.join("gpu-fallback-blocked").exists()
+        !path.join("dx12-gl-repair-attempted").exists()
+            && !path.join("gpu-fallback-blocked").exists()
+            && !path.join("dx12-fallback-blocked").exists()
     });
     #[cfg(target_os = "windows")]
     {
