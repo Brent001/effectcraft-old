@@ -8,9 +8,12 @@
 //! until its window has kept drawing for [`SETTLE`] (or the app quits normally before then). A
 //! launch that finds the previous one's marker on affected Intel Windows hardware tries
 //! DirectX 12 first, then OpenGL if DX12 also fails; elsewhere it tries OpenGL. `WGPU_BACKEND`
-//! (wgpu's own override) still wins. The marker is locked while its launch runs, so a second copy
-//! opened meanwhile isn't taken for a crash; and a window OpenGL can't open either puts Window
-//! Graphics back to Automatic ([`opengl_failed`]) rather than failing every launch.
+//! (wgpu's own override) still wins. A saved OpenGL fallback on affected Intel hardware is retried
+//! with DX12 when the adapter is available, because OpenGL cannot run the GPU compositor. If that
+//! DX12 retry also fails during startup, a block marker keeps later launches on OpenGL until the
+//! user changes Window Graphics. The marker is locked while its launch runs, so a second copy opened
+//! meanwhile isn't taken for a crash; a window OpenGL can't open either puts Window Graphics back
+//! to Automatic ([`opengl_failed`]) rather than failing every launch.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -21,6 +24,9 @@ use eframe::wgpu::Backends;
 
 /// Left in the settings folder from a launch until its window has settled.
 const MARKER: &str = "launch-pending";
+/// A DX12 startup failure was already recovered to OpenGL. Don't retry DX12 on every subsequent
+/// launch; clear this only when the user changes Window Graphics away from OpenGL.
+const DX12_FALLBACK_BLOCKED: &str = "dx12-fallback-blocked";
 
 /// How long the window keeps drawing after its first frame before the launch counts as made.
 /// A driver that fails as the window is shown and its surface re-created does so within the
@@ -52,6 +58,14 @@ impl Launch {
         let prefs_path = dir.join(PREFS_FILE);
         let mut prefs = std::fs::read_to_string(&prefs_path).map(|t| Prefs::from_json(&t)).unwrap_or_default();
         let marker = dir.join(MARKER);
+        let blocked_path = dir.join(DX12_FALLBACK_BLOCKED);
+        // Choosing Automatic or DX12 again is an explicit user request to leave the recovery
+        // fallback, so allow a fresh DX12 attempt.
+        if prefs.startup.window_graphics != "gl" && blocked_path.exists() {
+            if let Err(e) = std::fs::remove_file(&blocked_path) {
+                log::warn!("removing DX12 fallback marker failed: {e}");
+            }
+        }
         // Locked by another launch that is still opening its window: not a crash.
         let held = File::open(&marker).is_ok_and(|f| matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
         let mut notice = None;
@@ -61,7 +75,8 @@ impl Launch {
             && matches!(prefs.startup.window_graphics.as_str(), "auto" | "dx12")
         {
             // On affected Intel GPUs, Automatic first tries DX12 after a crash (Vulkan may fault
-            // in the vendor driver). If DX12 also fails, the next launch switches to OpenGL.
+            // in the vendor driver). If DX12 also fails, use OpenGL and suppress automatic retries.
+            let previous = prefs.startup.window_graphics.clone();
             let next = if prefs.startup.window_graphics == "auto" && cfg!(target_os = "windows") && prefer_dx12 {
                 "dx12"
             } else {
@@ -72,11 +87,31 @@ impl Launch {
                 Ok(()) => log::warn!("the last launch stopped as its window opened: switching Window Graphics to {next}"),
                 Err(e) => log::warn!("the last launch stopped as its window opened; saving Window Graphics failed: {e}"),
             }
+            if next == "gl" && previous == "dx12" && prefer_dx12 {
+                if let Err(e) = std::fs::write(&blocked_path, "DX12 startup failed; retry after changing Window Graphics.") {
+                    log::warn!("saving DX12 fallback marker failed: {e}");
+                }
+            }
             notice = Some(if next == "dx12" {
                 "EffectCraft's last launch stopped as its window opened. It will retry with DirectX 12, avoiding the Intel Vulkan path (Settings ▸ Startup & Repair ▸ Window Graphics). If that also fails, the next launch will try OpenGL.".to_string()
             } else {
-                "EffectCraft's last launch stopped as its window opened, so it will try OpenGL (Settings ▸ Startup & Repair ▸ Window Graphics). Updating the graphics driver may let it use Automatic again.".to_string()
+                "EffectCraft's last launch stopped as its window opened, so it will try OpenGL (Settings ▸ Startup & Repair ▸ Window Graphics). OpenGL disables the GPU compositor; change Window Graphics to Automatic or DirectX 12 to retry GPU acceleration after resolving the startup issue.".to_string()
             });
+        }
+        // A previous version may have left the machine on OpenGL after its recovery logic. If a
+        // compatible DX12 adapter is still present, repair that stale choice once and persist it.
+        // A failed DX12 launch above writes blocked_path, preventing a crash loop.
+        if prefer_dx12
+            && prefs.startup.window_graphics == "gl"
+            && !marker.exists()
+            && !blocked_path.exists()
+        {
+            prefs.startup.window_graphics = "dx12".into();
+            match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&prefs_path, prefs.to_json())) {
+                Ok(()) => log::warn!("OpenGL was saved as Window Graphics on an Intel GPU with DX12 support; retrying DX12 for GPU compositing"),
+                Err(e) => log::warn!("saving the DX12 Window Graphics repair failed: {e}"),
+            }
+            notice = Some("OpenGL was active, which disables EffectCraft's GPU compositor. A compatible Intel DirectX 12 adapter was detected, so EffectCraft is switching Window Graphics to DirectX 12 to enable GPU compositing. If startup fails, it will recover to OpenGL instead of repeatedly retrying.".to_string());
         }
         let backends = match prefs.startup.window_graphics.as_str() {
             "dx12" => Some(Backends::DX12),
@@ -145,6 +180,53 @@ mod tests {
 
     fn window_graphics(dir: &Path) -> String {
         Prefs::from_json(&std::fs::read_to_string(dir.join(PREFS_FILE)).unwrap_or_default()).startup.window_graphics
+    }
+
+    fn set_window_graphics(dir: &Path, value: &str) {
+        let _ = std::fs::create_dir_all(dir);
+        let mut prefs = Prefs::from_json(&std::fs::read_to_string(dir.join(PREFS_FILE)).unwrap_or_default());
+        prefs.startup.window_graphics = value.into();
+        let _ = std::fs::write(dir.join(PREFS_FILE), prefs.to_json());
+    }
+
+    /// A stale OpenGL selection on affected Intel hardware is repaired to DX12 when available.
+    #[test]
+    fn saved_opengl_is_repaired_to_dx12_when_compatible() {
+        let dir = std::env::temp_dir().join(format!("ec-launch-guard-repair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        set_window_graphics(&dir, "gl");
+        let mut launch = Launch::begin(Some(&dir), false, true);
+        assert_eq!(launch.backends, Some(Backends::DX12));
+        assert_eq!(window_graphics(&dir), "dx12");
+        assert!(launch.notice.as_deref().is_some_and(|n| n.contains("GPU compositor")));
+        launch.exited();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// If the repaired DX12 launch fails, OpenGL remains available without an automatic crash loop.
+    #[test]
+    fn dx12_recovery_blocks_retries_until_window_graphics_changes() {
+        let dir = std::env::temp_dir().join(format!("ec-launch-guard-block-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        set_window_graphics(&dir, "dx12");
+        drop(Launch::begin(Some(&dir), false, true));
+        let mut fallback = Launch::begin(Some(&dir), false, true);
+        assert_eq!(fallback.backends, Some(Backends::GL));
+        assert!(fallback.notice.as_deref().is_some_and(|n| n.contains("OpenGL disables")));
+        assert!(dir.join(DX12_FALLBACK_BLOCKED).exists());
+        fallback.exited();
+
+        let mut safe = Launch::begin(Some(&dir), false, true);
+        assert_eq!(safe.backends, Some(Backends::GL), "don't retry a backend that failed during startup");
+        assert!(safe.notice.is_none());
+        safe.exited();
+
+        set_window_graphics(&dir, "auto");
+        let mut retry = Launch::begin(Some(&dir), false, true);
+        assert_eq!(retry.backends, None);
+        assert!(!dir.join(DX12_FALLBACK_BLOCKED).exists(), "changing the preference permits a new attempt");
+        retry.exited();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A launch that never drew falls back to OpenGL, unless affected Intel hardware gets a DX12 retry (#243).
