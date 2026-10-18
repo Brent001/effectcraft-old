@@ -44,10 +44,10 @@ pub struct Launch {
 }
 
 impl Launch {
-    /// Read Window Graphics in the settings folder `dir`, switch it to OpenGL when the previous
-    /// launch stopped as its window opened (where OpenGL exists: not macOS), and leave this
-    /// launch's marker. `env_override`: `WGPU_BACKEND` is set.
-    pub fn begin(dir: Option<&Path>, env_override: bool) -> Launch {
+    /// Read Window Graphics in the settings folder `dir`, recover from a failed launch, and
+    /// leave this launch's marker. `prefer_dx12` is true when affected Intel hardware has a
+    /// usable DX12 adapter. `env_override`: `WGPU_BACKEND` is set.
+    pub fn begin(dir: Option<&Path>, env_override: bool, prefer_dx12: bool) -> Launch {
         let Some(dir) = dir.filter(|_| !env_override) else { return Launch::default() };
         let prefs_path = dir.join(PREFS_FILE);
         let mut prefs = std::fs::read_to_string(&prefs_path).map(|t| Prefs::from_json(&t)).unwrap_or_default();
@@ -55,20 +55,34 @@ impl Launch {
         // Locked by another launch that is still opening its window: not a crash.
         let held = File::open(&marker).is_ok_and(|f| matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
         let mut notice = None;
-        if marker.exists() && !held && prefs.startup.window_graphics == "auto" && cfg!(not(target_os = "macos")) {
-            prefs.startup.window_graphics = "gl".into();
+        if marker.exists()
+            && !held
+            && cfg!(not(target_os = "macos"))
+            && matches!(prefs.startup.window_graphics.as_str(), "auto" | "dx12")
+        {
+            // On affected Intel GPUs, Automatic first tries DX12 after a crash (Vulkan may fault
+            // in the vendor driver). If DX12 also fails, the next launch switches to OpenGL.
+            let next = if prefs.startup.window_graphics == "auto" && cfg!(target_os = "windows") && prefer_dx12 {
+                "dx12"
+            } else {
+                "gl"
+            };
+            prefs.startup.window_graphics = next.into();
             match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&prefs_path, prefs.to_json())) {
-                Ok(()) => log::warn!("the last launch stopped as its window opened: switching Window Graphics to OpenGL"),
+                Ok(()) => log::warn!("the last launch stopped as its window opened: switching Window Graphics to {next}"),
                 Err(e) => log::warn!("the last launch stopped as its window opened; saving Window Graphics failed: {e}"),
             }
-            notice = Some(
-                "EffectCraft's last launch stopped as its window opened, so it now draws with OpenGL \
-                 (Settings ▸ Startup & Repair ▸ Window Graphics). Updating the graphics driver may let it use \
-                 Automatic again."
-                    .to_string(),
-            );
+            notice = Some(if next == "dx12" {
+                "EffectCraft's last launch stopped as its window opened. It will retry with DirectX 12, avoiding the Intel Vulkan path (Settings ▸ Startup & Repair ▸ Window Graphics). If that also fails, the next launch will try OpenGL.".to_string()
+            } else {
+                "EffectCraft's last launch stopped as its window opened, so it will try OpenGL (Settings ▸ Startup & Repair ▸ Window Graphics). Updating the graphics driver may let it use Automatic again.".to_string()
+            });
         }
-        let backends = (prefs.startup.window_graphics == "gl").then_some(Backends::GL);
+        let backends = match prefs.startup.window_graphics.as_str() {
+            "dx12" => Some(Backends::DX12),
+            "gl" => Some(Backends::GL),
+            _ => None,
+        };
         let (marker, lock) = match std::fs::create_dir_all(dir).and_then(|()| File::create(&marker)) {
             // Where locks aren't available the guard works as before.
             Ok(f) => (Some(marker), f.try_lock().is_ok().then_some(f)),
@@ -133,14 +147,14 @@ mod tests {
         Prefs::from_json(&std::fs::read_to_string(dir.join(PREFS_FILE)).unwrap_or_default()).startup.window_graphics
     }
 
-    /// A launch that never drew switches the next one to OpenGL, which then stays (#243).
+    /// A launch that never drew falls back to OpenGL, unless affected Intel hardware gets a DX12 retry (#243).
     #[test]
     fn a_launch_that_never_drew_switches_the_next_to_opengl() {
         let dir = std::env::temp_dir().join(format!("ec-launch-guard-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // A first launch that draws: nothing changes. Its first frames don't settle it (a driver
         // may still crash as the window is shown); frames for `SETTLE` do.
-        let mut l = Launch::begin(Some(&dir), false);
+        let mut l = Launch::begin(Some(&dir), false, false);
         assert_eq!((l.backends, l.notice.is_some()), (None, false));
         assert!(dir.join(MARKER).exists());
         let t0 = Instant::now();
@@ -166,8 +180,29 @@ mod tests {
         }
         // `WGPU_BACKEND` wins, and leaves no marker.
         let _ = std::fs::remove_file(dir.join(MARKER));
-        assert_eq!(Launch::begin(Some(&dir), true).backends, None);
+        assert_eq!(Launch::begin(Some(&dir), true, false).backends, None);
         assert!(!dir.join(MARKER).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On affected Intel Windows hardware a failed Automatic launch retries DX12, then OpenGL.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn affected_intel_retries_dx12_before_opengl() {
+        let dir = std::env::temp_dir().join(format!("ec-launch-guard-dx12-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // First attempt was Automatic and crashed before drawing.
+        drop(Launch::begin(Some(&dir), false, true));
+        let dx12 = Launch::begin(Some(&dir), false, true);
+        assert_eq!(dx12.backends, Some(Backends::DX12));
+        assert!(dx12.notice.as_deref().is_some_and(|n| n.contains("DirectX 12")));
+        assert_eq!(window_graphics(&dir), "dx12");
+        // DX12 also failed: next attempt uses OpenGL to avoid repeating the crash.
+        drop(dx12);
+        let gl = Launch::begin(Some(&dir), false, true);
+        assert_eq!(gl.backends, Some(Backends::GL));
+        assert_eq!(window_graphics(&dir), "gl");
+        drop(gl);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
