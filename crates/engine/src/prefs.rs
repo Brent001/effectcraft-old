@@ -42,7 +42,8 @@ pub const LANGUAGES: &[(&str, &str)] = &[
 #[cfg(target_os = "windows")]
 pub const WINDOW_GRAPHICS: &[(&str, &str)] = &[
     ("Automatic", "auto"),
-    ("DirectX 12 (compatibility)", "dx12"),
+    ("DirectX 12", "dx12"),
+    ("Vulkan (compatibility)", "vulkan"),
     ("OpenGL (compatibility)", "gl"),
 ];
 #[cfg(not(target_os = "windows"))]
