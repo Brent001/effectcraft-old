@@ -535,16 +535,26 @@ impl GpuContext {
                 })
             })
         };
-        // The compositor's own kernels are required; an effect kernel that doesn't build is
-        // left out, and its effects render on the CPU (see `Enc::take_missing`).
+        // Core compositing and sky kernels are required. Classic 3D is optional like an effect:
+        // FXC on DirectX 12 can reject its dynamic component writes, so its 3D runs then render on
+        // the CPU instead of disabling the entire compositor.
         let mut pipelines = ENTRIES
             .iter()
             .chain(crate::adv3d::SKY_KERNELS)
-            .map(|e| (e, &layout))
-            .chain(EXT_ENTRIES.iter().map(|e| (e, &layout_ext)))
-            .map(|(e, layout)| Ok((*e, build(e, layout)?)))
+            .map(|e| Ok((*e, build(e, &layout)?)))
             .collect::<Result<HashMap<_, _>, String>>()?;
         let mut unavailable = vec![];
+        for e in EXT_ENTRIES {
+            match build(e, &layout_ext) {
+                Ok(p) => {
+                    pipelines.insert(*e, p);
+                }
+                Err(why) => {
+                    log::warn!("gpu {name}: kernel {e} unavailable, its 3D layers render on the CPU: {why}");
+                    unavailable.push((*e, why));
+                }
+            }
+        }
         for e in EFFECT_ENTRIES
             .iter()
             .chain(crate::fx_color::KERNELS)
@@ -812,6 +822,11 @@ impl GpuContext {
 
     /// Readbacks (GPU → CPU) are possible: waited for natively, or deferred (a browser
     /// worker, [`crate::deferred`]). Impossible on the browser's main thread.
+    /// Whether a kernel is available (Classic 3D and effect kernels may fall back to the CPU).
+    pub(crate) fn has_kernel(&self, entry: &str) -> bool {
+        self.pipelines.contains_key(entry)
+    }
+
     /// Effect kernels the device couldn't build, with why: their effects render on the CPU.
     pub fn unavailable_kernels(&self) -> &[(&'static str, String)] {
         &self.unavailable
