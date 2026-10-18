@@ -154,9 +154,17 @@ fn main() -> eframe::Result {
     // Wayland shows the window's icon from its desktop entry: an AppImage brings its own.
     #[cfg(target_os = "linux")]
     appimage::integrate_from_env(ICON_PNG);
-    // Settings ▸ Startup & Repair ▸ Window Graphics, switched to OpenGL when the last launch
-    // stopped as its window opened (a crashing graphics driver, #243).
-    let mut launch = launch_guard::Launch::begin(effectcraft_host::config_dir().as_deref(), std::env::var_os("WGPU_BACKEND").is_some());
+    // Settings ▸ Startup & Repair ▸ Window Graphics: prefer DX12 on affected Intel hardware,
+    // and retry DX12 before the OpenGL compatibility fallback after a failed launch (#243).
+    #[cfg(target_os = "windows")]
+    let prefer_dx12 = use_dx12_for_affected_intel();
+    #[cfg(not(target_os = "windows"))]
+    let prefer_dx12 = false;
+    let mut launch = launch_guard::Launch::begin(
+        effectcraft_host::config_dir().as_deref(),
+        std::env::var_os("WGPU_BACKEND").is_some(),
+        prefer_dx12,
+    );
     let on_gl = launch.backends == Some(eframe::wgpu::Backends::GL);
     let notice = launch.notice.take();
     let options = eframe::NativeOptions {
@@ -171,7 +179,7 @@ fn main() -> eframe::Result {
             // Wayland matches the window to `ai.storyteller.effectcraft.desktop` by this ID.
             .with_app_id(appimage::APP_ID),
         event_loop_builder: agent_event_loop(control_port.is_some()),
-        wgpu_options: wgpu_options(launch.backends),
+        wgpu_options: wgpu_options(launch.backends, prefer_dx12),
         ..Default::default()
     };
     // Start-up milestones go to stderr and the session log, so a window that never appears
@@ -343,11 +351,43 @@ fn main() -> eframe::Result {
 /// instead of eframe's fixed set: an older GPU that can't meet those (Intel HD Graphics 5500,
 /// #198) still opens the app, and the compositor then checks what it needs and falls back to
 /// the CPU when the device can't run it. `backends`: Window Graphics' choice, when it makes one.
-fn wgpu_options(backends: Option<eframe::wgpu::Backends>) -> eframe::WgpuConfiguration {
+/// Intel Gen 9–11 integrated GPU device IDs whose Vulkan drivers are known to be fragile
+/// in this compositor. Device IDs are PCI IDs (the Intel HD Graphics 520 is 0x1916).
+#[cfg(target_os = "windows")]
+fn intel_gen9_to_gen11(device: u32) -> bool {
+    matches!(device >> 8, 0x19 | 0x1a | 0x31 | 0x3e | 0x45 | 0x4e | 0x59 | 0x5a | 0x87 | 0x8a | 0x9b)
+        || device == 0x0a84
+}
+
+/// Probe DirectX 12 only, without initialising Vulkan. On affected Intel hardware this lets
+/// EffectCraft choose DX12 before the known Intel Vulkan driver can crash during adapter/device
+/// creation. An explicit WGPU_BACKEND remains authoritative.
+#[cfg(target_os = "windows")]
+fn use_dx12_for_affected_intel() -> bool {
+    if std::env::var_os("WGPU_BACKEND").is_some() {
+        return false;
+    }
+    let mut descriptor = eframe::wgpu::InstanceDescriptor::new_without_display_handle();
+    descriptor.backends = eframe::wgpu::Backends::DX12;
+    let instance = eframe::wgpu::Instance::new(descriptor);
+    let found = instance.enumerate_adapters(eframe::wgpu::Backends::DX12).iter().any(|adapter| {
+        let info = adapter.get_info();
+        info.vendor == 0x8086
+            && info.device_type == eframe::wgpu::DeviceType::IntegratedGpu
+            && intel_gen9_to_gen11(info.device)
+    });
+    if found {
+        log::warn!("affected Intel integrated graphics detected; preferring DirectX 12 over the Intel Vulkan path");
+    }
+    found
+}
+
+fn wgpu_options(backends: Option<eframe::wgpu::Backends>, prefer_dx12: bool) -> eframe::WgpuConfiguration {
     use eframe::egui_wgpu::WgpuSetup;
+    let effective_backends = backends.or_else(|| prefer_dx12.then_some(eframe::wgpu::Backends::DX12));
     let mut config = eframe::WgpuConfiguration::default();
     if let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
-        if let Some(b) = backends {
+        if let Some(b) = effective_backends {
             setup.instance_descriptor.backends = b;
         }
         // Nothing draws or dispatches indirectly, so wgpu's check of indirect arguments only costs
@@ -474,6 +514,14 @@ mod tests {
     use super::{Args, parse_args};
     use std::env::VarError;
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn intel_device_picker_recognises_hd_520() {
+        assert!(super::intel_gen9_to_gen11(0x1916));
+        assert!(super::intel_gen9_to_gen11(0x3e9b));
+        assert!(!super::intel_gen9_to_gen11(0x46a6));
+    }
+
     fn parse_env(args: &[&str], env_port: Result<String, VarError>) -> Result<Option<Args>, String> {
         parse_args(args.iter().map(|a| a.to_string()), env_port)
     }
@@ -503,7 +551,7 @@ mod tests {
         if std::env::var_os("WGPU_VALIDATION_INDIRECT_CALL").is_some() {
             return;
         }
-        let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = super::wgpu_options(None).wgpu_setup else {
+        let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = super::wgpu_options(None, false).wgpu_setup else {
             panic!("the default setup creates its own instance");
         };
         // Intel Metal can't compile the validation's compute shader, and the device is lost.

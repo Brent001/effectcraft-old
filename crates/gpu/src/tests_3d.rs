@@ -209,6 +209,10 @@ fn the_gpu_draws_classic_3d_runs_itself() {
     assert_eq!(prep.planes.iter().filter(|p| p.draw).count(), 3);
     let mut e = crate::context::Enc::new(g.context());
     let canvas = e.image(W, H);
+    if !g.context().has_kernel("classic3d") {
+        // Some DX12 compiler versions reject the kernel; in that case the 3D run is CPU-rendered.
+        return;
+    }
     let out = crate::classic3d::draw_run(&mut e, &prep, &canvas).expect("the kernel draws the run");
     let img = e.download(&out).unwrap();
     let mut cpu = effectcraft_raster::Image::new(W, H);
@@ -251,9 +255,11 @@ fn bokeh_depth_of_field_runs_on_the_gpu() {
                 let run: Vec<_> = r.visible_layers(&ctx).into_iter().filter(|l| l.is_3d()).collect();
                 let prep = r.prepare_3d_run(&ctx, &run, (W, H)).unwrap();
                 assert!(prep.planes.iter().filter(|p| p.draw).all(|p| p.dof.is_some()), "{label}: depth of field deferred to the GPU");
-                let mut e = crate::context::Enc::new(g.context());
-                let canvas = e.image(W, H);
-                assert!(crate::classic3d::draw_run(&mut e, &prep, &canvas).is_some(), "{label}: drawn on the GPU");
+                if g.context().has_kernel("classic3d") {
+                    let mut e = crate::context::Enc::new(g.context());
+                    let canvas = e.image(W, H);
+                    assert!(crate::classic3d::draw_run(&mut e, &prep, &canvas).is_some(), "{label}: drawn on the GPU");
+                }
             }
         }
     }
@@ -286,5 +292,29 @@ fn two_d_layer_with_a_three_d_track_matte() {
             s.p.comp_mut(s.cid).unwrap().renderer = effectcraft_project::Renderer::Advanced3D;
             check(&format!("3d matte {kind:?} {depth:?} (Advanced 3D)"), compare_at(&s, opts(), Tick::ZERO), 0.005);
         }
+    }
+}
+
+/// Classic 3D keeps the compositor usable if a graphics compiler rejects its optional kernel:
+/// the 3D run should be rendered on the CPU and match the reference renderer.
+#[test]
+fn classic_3d_runs_render_on_the_cpu_without_the_kernel() {
+    if gpu().is_none() {
+        return;
+    }
+    let Ok(mut ctx) = pollster::block_on(crate::context::GpuContext::request()) else { return };
+    ctx.drop_kernel("classic3d");
+    assert!(!ctx.has_kernel("classic3d"));
+    let g = crate::Gpu::from_context(ctx);
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let mut s = crossing(depth, BlendMode::Normal);
+        camera(&mut s, [30.0, 20.0, -260.0], None);
+        let cpu = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Cpu, ..opts() }).comp_frame_cpu(s.cid, Tick::ZERO);
+        let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+        r.accel = Some(&g);
+        let img = g.render(&r, s.cid, Tick::ZERO).expect("the compositor renders the frame");
+        let mut d = crate::tests::diff(&cpu, &img, crate::tests::tolerance(depth));
+        d.quantized = depth != BitDepth::Bpc32;
+        crate::tests::check(&format!("Classic 3D CPU fallback without its kernel {depth:?}"), Some(d), 0.0);
     }
 }

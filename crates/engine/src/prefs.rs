@@ -39,6 +39,13 @@ pub const LANGUAGES: &[(&str, &str)] = &[
 ];
 
 /// Settings ▸ Startup & Repair ▸ Window Graphics: (label, `startup.windowGraphics` value).
+#[cfg(target_os = "windows")]
+pub const WINDOW_GRAPHICS: &[(&str, &str)] = &[
+    ("Automatic", "auto"),
+    ("DirectX 12 (compatibility)", "dx12"),
+    ("OpenGL (compatibility)", "gl"),
+];
+#[cfg(not(target_os = "windows"))]
 pub const WINDOW_GRAPHICS: &[(&str, &str)] = &[("Automatic", "auto"), ("OpenGL (compatibility)", "gl")];
 
 /// Settings ▸ Appearance ▸ Appearance Mode: (label, `appearance.appearanceMode` value). Auto
