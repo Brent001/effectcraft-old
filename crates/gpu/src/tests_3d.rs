@@ -313,7 +313,8 @@ fn classic_3d_runs_render_on_the_cpu_without_the_kernel() {
         let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
         r.accel = Some(&g);
         let img = g.render(&r, s.cid, Tick::ZERO).expect("the compositor renders the frame");
-        let d = crate::tests::diff(&cpu, &img, if depth == BitDepth::Bpc8 { 1.0 / 255.0 } else { 0.0 });
-        assert_eq!(d.over, 0, "CPU fallback without classic3d should match {depth:?}: {d:?}");
+        let mut d = crate::tests::diff(&cpu, &img, crate::tests::tolerance(depth));
+        d.quantized = depth != BitDepth::Bpc32;
+        crate::tests::check(&format!("Classic 3D CPU fallback without its kernel {depth:?}"), Some(d), 0.0);
     }
 }
