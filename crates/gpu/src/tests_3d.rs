@@ -294,3 +294,26 @@ fn two_d_layer_with_a_three_d_track_matte() {
         }
     }
 }
+
+/// Classic 3D keeps the compositor usable if a graphics compiler rejects its optional kernel:
+/// the 3D run should be rendered on the CPU and match the reference renderer.
+#[test]
+fn classic_3d_runs_render_on_the_cpu_without_the_kernel() {
+    if gpu().is_none() {
+        return;
+    }
+    let Ok(mut ctx) = pollster::block_on(crate::context::GpuContext::request()) else { return };
+    ctx.drop_kernel("classic3d");
+    assert!(!ctx.has_kernel("classic3d"));
+    let g = crate::Gpu::from_context(ctx);
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let mut s = crossing(depth, BlendMode::Normal);
+        camera(&mut s, [30.0, 20.0, -260.0], None);
+        let cpu = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Cpu, ..opts() }).comp_frame_cpu(s.cid, Tick::ZERO);
+        let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+        r.accel = Some(&g);
+        let img = g.render(&r, s.cid, Tick::ZERO).expect("the compositor renders the frame");
+        let d = crate::tests::diff(&cpu, &img, if depth == BitDepth::Bpc8 { 1.0 / 255.0 } else { 0.0 });
+        assert_eq!(d.over, 0, "CPU fallback without classic3d should match {depth:?}: {d:?}");
+    }
+}
