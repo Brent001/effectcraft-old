@@ -281,19 +281,22 @@ fn main() -> eframe::Result {
     #[cfg(target_os = "windows")]
     let startup_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     #[cfg(target_os = "windows")]
+    let startup_config_dir = effectcraft_host::config_dir();
+    #[cfg(target_os = "windows")]
+    let startup_preference = configured_window_graphics(startup_config_dir.as_deref());
+    #[cfg(target_os = "windows")]
+    let migration_pending = startup_config_dir.as_deref().is_some_and(|path| {
+        !path.join("dx12-gl-repair-attempted").exists() && !path.join("gpu-fallback-blocked").exists()
+    });
+    #[cfg(target_os = "windows")]
     {
-        let dir = effectcraft_host::config_dir();
-        let preference = configured_window_graphics(dir.as_deref());
         let externally_overridden = std::env::var_os("WGPU_BACKEND").is_some() && recovery_backend.is_none();
-        let migration_pending = dir.as_deref().is_some_and(|path| {
-            !path.join("dx12-gl-repair-attempted").exists() && !path.join("gpu-fallback-blocked").exists()
-        });
         let should_watch = recovery_step < 2
             && !externally_overridden
             && (recovery_backend.as_deref() == Some("vulkan")
-                || (recovery_backend.is_none() && (preference != "gl" || migration_pending)));
+                || (recovery_backend.is_none() && (startup_preference != "gl" || migration_pending)));
         if should_watch {
-            let fallback = if recovery_backend.as_deref() == Some("vulkan") || preference == "vulkan" {
+            let fallback = if recovery_backend.as_deref() == Some("vulkan") || startup_preference == "vulkan" {
                 "gl"
             } else {
                 "vulkan"
@@ -302,16 +305,22 @@ fn main() -> eframe::Result {
                 startup_ready.clone(),
                 recovery_step,
                 std::env::args_os().skip(1).collect(),
-                dir,
+                startup_config_dir.clone(),
                 fallback,
             );
         }
     }
 
-    // Settings ▸ Startup & Repair ▸ Window Graphics: prefer DX12 on affected Intel hardware.
-    // A recovery child skips the fragile DX12 probe and uses its explicit fallback backend.
+    // Probe DirectX 12 only when Automatic or the one-time legacy OpenGL migration may use it.
+    // Explicit DX12/Vulkan selections and recovery children should not touch another backend first.
     #[cfg(target_os = "windows")]
-    let prefer_dx12 = if recovery_backend.is_some() { false } else { use_dx12_for_affected_intel() };
+    let prefer_dx12 = if recovery_backend.is_some()
+        || (startup_preference != "auto" && !(startup_preference == "gl" && migration_pending))
+    {
+        false
+    } else {
+        use_dx12_for_affected_intel()
+    };
     #[cfg(not(target_os = "windows"))]
     let prefer_dx12 = false;
     let mut launch = launch_guard::Launch::begin(
