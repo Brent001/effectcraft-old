@@ -165,9 +165,9 @@ mod tests {
         assert!(!dir.join(MARKER).exists());
         assert_eq!(l.frame_drawn_at(t0 + SETTLE), None, "settled stays settled");
         // A launch that crashes before drawing (it never calls `drawn`)…
-        drop(Launch::begin(Some(&dir), false));
+        drop(Launch::begin(Some(&dir), false, false));
         // …makes the next one use OpenGL and say so, once.
-        let mut l = Launch::begin(Some(&dir), false);
+        let mut l = Launch::begin(Some(&dir), false, false);
         if cfg!(target_os = "macos") {
             assert_eq!((l.backends, l.notice.is_some()), (None, false), "no OpenGL on macOS");
         } else {
@@ -175,7 +175,7 @@ mod tests {
             assert!(l.notice.is_some());
             assert_eq!(window_graphics(&dir), "gl", "saved in Settings");
             l.exited();
-            let l = Launch::begin(Some(&dir), false);
+            let l = Launch::begin(Some(&dir), false, false);
             assert_eq!((l.backends, l.notice.is_some()), (Some(Backends::GL), false), "it stays, without the notice");
         }
         // `WGPU_BACKEND` wins, and leaves no marker.
@@ -213,10 +213,10 @@ mod tests {
     fn a_launch_that_stops_after_its_first_frame_switches_the_next_to_opengl() {
         let dir = std::env::temp_dir().join(format!("ec-launch-guard-3-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut l = Launch::begin(Some(&dir), false);
+        let mut l = Launch::begin(Some(&dir), false, false);
         assert!(l.frame_drawn().is_some());
         drop(l);
-        let l = Launch::begin(Some(&dir), false);
+        let l = Launch::begin(Some(&dir), false, false);
         if cfg!(target_os = "macos") {
             assert_eq!(l.backends, None, "no OpenGL on macOS");
         } else {
@@ -226,11 +226,11 @@ mod tests {
         drop(l);
         let _ = std::fs::remove_dir_all(&dir);
         // Quitting right after the window opened leaves no marker.
-        let mut l = Launch::begin(Some(&dir), false);
+        let mut l = Launch::begin(Some(&dir), false, false);
         assert!(l.frame_drawn().is_some());
         l.exited();
         assert!(!dir.join(MARKER).exists());
-        assert_eq!(Launch::begin(Some(&dir), false).backends, None);
+        assert_eq!(Launch::begin(Some(&dir), false, false).backends, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -240,15 +240,15 @@ mod tests {
     fn a_second_copy_or_failed_opengl_doesnt_strand_window_graphics() {
         let dir = std::env::temp_dir().join(format!("ec-launch-guard-2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let _first = Launch::begin(Some(&dir), false);
-        assert_eq!(Launch::begin(Some(&dir), false).backends, None);
+        let _first = Launch::begin(Some(&dir), false, false);
+        assert_eq!(Launch::begin(Some(&dir), false, false).backends, None);
         assert_eq!(window_graphics(&dir), "auto");
         drop(_first);
         if cfg!(not(target_os = "macos")) {
-            assert_eq!(Launch::begin(Some(&dir), false).backends, Some(Backends::GL), "a real crash still switches");
+            assert_eq!(Launch::begin(Some(&dir), false, false).backends, Some(Backends::GL), "a real crash still switches");
             opengl_failed(Some(&dir));
             assert_eq!(window_graphics(&dir), "auto");
-            assert_eq!(Launch::begin(Some(&dir), false).backends, None);
+            assert_eq!(Launch::begin(Some(&dir), false, false).backends, None);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
