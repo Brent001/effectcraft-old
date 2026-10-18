@@ -122,6 +122,111 @@ fn control_port(name: &str, value: Option<&str>) -> Result<u16, String> {
     }
 }
 
+#[cfg(target_os = "windows")]
+const STARTUP_WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(18);
+
+/// A backend chosen by the startup watchdog's child process. These are internal recovery settings,
+/// not a replacement for the user's public WGPU_BACKEND override.
+#[cfg(target_os = "windows")]
+fn startup_recovery_backend() -> Option<String> {
+    std::env::var("EFFECTCRAFT_STARTUP_RECOVERY_BACKEND")
+        .ok()
+        .filter(|backend| matches!(backend.as_str(), "vulkan" | "gl"))
+}
+
+#[cfg(target_os = "windows")]
+fn startup_recovery_step() -> u8 {
+    std::env::var("EFFECTCRAFT_STARTUP_RECOVERY_STEP")
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(0)
+        .min(2)
+}
+
+#[cfg(target_os = "windows")]
+fn configured_window_graphics(dir: Option<&std::path::Path>) -> String {
+    let Some(dir) = dir else { return "auto".into() };
+    let contents = std::fs::read_to_string(dir.join(effectcraft_engine::prefs::PREFS_FILE)).unwrap_or_default();
+    effectcraft_engine::prefs::Prefs::from_json(&contents).startup.window_graphics
+}
+
+#[cfg(target_os = "windows")]
+fn save_window_graphics_preference(dir: Option<&std::path::Path>, backend: &str) -> Result<(), String> {
+    let Some(dir) = dir else {
+        return Err("EffectCraft's settings folder is unavailable".into());
+    };
+    std::fs::create_dir_all(dir).map_err(|e| format!("create settings folder: {e}"))?;
+    let path = dir.join(effectcraft_engine::prefs::PREFS_FILE);
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut prefs = effectcraft_engine::prefs::Prefs::from_json(&contents);
+    prefs.startup.window_graphics = backend.into();
+    std::fs::write(path, prefs.to_json()).map_err(|e| format!("save Window Graphics={backend}: {e}"))
+}
+
+/// wgpu's DX12 adapter/device setup can block in a vendor driver before eframe invokes the app
+/// creator (and before any window appears). A separate watchdog can still recover from that state.
+/// First retry Vulkan, then OpenGL as a last-resort visible-window fallback. The child waits briefly
+/// for this process to exit, so the launch-guard file lock is released before it is inspected.
+#[cfg(target_os = "windows")]
+fn start_startup_watchdog(
+    ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    step: u8,
+    args: Vec<std::ffi::OsString>,
+    config_dir: Option<std::path::PathBuf>,
+) {
+    if step >= 2 {
+        return;
+    }
+    let spawn = std::thread::Builder::new().name("effectcraft-startup-watchdog".into()).spawn(move || {
+        std::thread::sleep(STARTUP_WINDOW_TIMEOUT);
+        if ready.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+
+        let fallback = if step == 0 { "vulkan" } else { "gl" };
+        if let Err(error) = save_window_graphics_preference(config_dir.as_deref(), fallback) {
+            log::warn!("startup watchdog could not save the {fallback} fallback: {error}");
+        }
+        log::error!(
+            "no eframe app/window was created within {:?}; restarting EffectCraft with {fallback}",
+            STARTUP_WINDOW_TIMEOUT
+        );
+
+        let executable = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(error) => {
+                log::error!("startup recovery could not locate EffectCraft.exe: {error}");
+                std::process::exit(2);
+            }
+        };
+        let child = std::process::Command::new(executable)
+            .args(args)
+            .env("EFFECTCRAFT_STARTUP_RECOVERY_STEP", (step + 1).to_string())
+            .env("EFFECTCRAFT_STARTUP_RECOVERY_BACKEND", fallback)
+            .spawn();
+        match child {
+            Ok(_child) => {
+                log::warn!("starting the {fallback} recovery process; exiting the unresponsive startup process");
+                std::process::exit(0);
+            }
+            Err(error) => {
+                log::error!("could not start the {fallback} recovery process: {error}");
+                let _ = rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("EffectCraft graphics startup")
+                    .set_description(format!(
+                        "EffectCraft could not create a window with its current graphics backend, and automatic recovery could not start the {fallback} fallback. Open Settings ▸ Startup & Repair ▸ Window Graphics and choose {fallback}."
+                    ))
+                    .show();
+                std::process::exit(2);
+            }
+        }
+    });
+    if let Err(error) = spawn {
+        log::error!("could not create EffectCraft's startup watchdog: {error}");
+    }
+}
+
 fn main() -> eframe::Result {
     // First, so the panic hook and every start-up warning are recorded. Records go to stderr
     // and the session log; Help ▸ Enable Logging writes through this logger too, and warnings
@@ -154,10 +259,42 @@ fn main() -> eframe::Result {
     // Wayland shows the window's icon from its desktop entry: an AppImage brings its own.
     #[cfg(target_os = "linux")]
     appimage::integrate_from_env(ICON_PNG);
-    // Settings ▸ Startup & Repair ▸ Window Graphics: prefer DX12 on affected Intel hardware,
-    // and retry DX12 before the OpenGL compatibility fallback after a failed launch (#243).
+    // Recovery children pause briefly so their predecessor can exit and release the launch marker.
     #[cfg(target_os = "windows")]
-    let prefer_dx12 = use_dx12_for_affected_intel();
+    let recovery_step = startup_recovery_step();
+    #[cfg(target_os = "windows")]
+    let recovery_backend = startup_recovery_backend();
+    #[cfg(target_os = "windows")]
+    if recovery_step > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
+    #[cfg(target_os = "windows")]
+    let startup_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(target_os = "windows")]
+    {
+        let dir = effectcraft_host::config_dir();
+        let preference = configured_window_graphics(dir.as_deref());
+        let externally_overridden = std::env::var_os("WGPU_BACKEND").is_some() && recovery_backend.is_none();
+        let migration_pending = dir.as_deref().is_some_and(|path| {
+            !path.join("dx12-gl-repair-attempted").exists() && !path.join("gpu-fallback-blocked").exists()
+        });
+        let should_watch = recovery_step < 2
+            && !externally_overridden
+            && (recovery_backend.is_some() || preference != "gl" || migration_pending);
+        if should_watch {
+            start_startup_watchdog(
+                startup_ready.clone(),
+                recovery_step,
+                std::env::args_os().skip(1).collect(),
+                dir,
+            );
+        }
+    }
+
+    // Settings ▸ Startup & Repair ▸ Window Graphics: prefer DX12 on affected Intel hardware.
+    // A recovery child skips the fragile DX12 probe and uses its explicit fallback backend.
+    #[cfg(target_os = "windows")]
+    let prefer_dx12 = if recovery_backend.is_some() { false } else { use_dx12_for_affected_intel() };
     #[cfg(not(target_os = "windows"))]
     let prefer_dx12 = false;
     let mut launch = launch_guard::Launch::begin(
@@ -165,6 +302,22 @@ fn main() -> eframe::Result {
         std::env::var_os("WGPU_BACKEND").is_some(),
         prefer_dx12,
     );
+    #[cfg(target_os = "windows")]
+    if let Some(backend) = recovery_backend.as_deref() {
+        let selected = match backend {
+            "vulkan" => eframe::wgpu::Backends::VULKAN,
+            "gl" => eframe::wgpu::Backends::GL,
+            _ => eframe::wgpu::Backends::all(),
+        };
+        launch.backends = Some(selected);
+        if let Err(error) = save_window_graphics_preference(effectcraft_host::config_dir().as_deref(), backend) {
+            log::warn!("saving startup recovery backend {backend}: {error}");
+        }
+        launch.notice = Some(match backend {
+            "vulkan" => "DirectX 12 did not create a visible window in time. EffectCraft restarted with Vulkan; GPU compositing will remain enabled if this driver supports the required compute features.".into(),
+            _ => "Both DirectX 12 and Vulkan failed to create a visible window in time. EffectCraft restarted with OpenGL as a safe visible-window fallback; the GPU compositor is unavailable on OpenGL.".into(),
+        });
+    }
     let on_gl = launch.backends == Some(eframe::wgpu::Backends::GL);
     let notice = launch.notice.take();
     let options = eframe::NativeOptions {
@@ -191,10 +344,16 @@ fn main() -> eframe::Result {
     let apple_events = apple_events::AppleEvents::install();
     #[cfg(target_os = "macos")]
     let apple_events = &apple_events;
+    #[cfg(target_os = "windows")]
+    let startup_ready_for_creator = startup_ready.clone();
     let result = eframe::run_native(
         "EffectCraft",
         options,
         Box::new(move |cc| {
+            // If we reached the app creator, eframe built the window and graphics device. The
+            // watchdog is only for a driver that blocks before this point and leaves no window.
+            #[cfg(target_os = "windows")]
+            startup_ready_for_creator.store(true, std::sync::atomic::Ordering::Release);
             match &cc.wgpu_render_state {
                 Some(rs) => log::info!("graphics: {:?}", rs.adapter.get_info()),
                 None => log::info!("graphics: no wgpu device"),
@@ -415,7 +574,7 @@ fn device_limits(adapter: eframe::wgpu::Limits) -> eframe::wgpu::Limits {
 /// silently, since release builds on Windows have no console. `gl_next`: the launch guard has
 /// the next launch try OpenGL.
 fn startup_failed(e: &eframe::Error, gl_next: bool) {
-    let next = if gl_next { "The next launch will try OpenGL instead. " } else { "" };
+    let next = if gl_next { "The next launch will try the next graphics backend (Vulkan, then OpenGL) instead. " } else { "" };
     let message = format!(
         "EffectCraft couldn't start its window: {e}\n\n{next}Updating the graphics driver often helps. If it keeps happening, please report it at https://github.com/storytold/effectcraft/issues with this message."
     );
