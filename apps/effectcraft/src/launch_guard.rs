@@ -19,8 +19,8 @@ use eframe::wgpu::Backends;
 
 /// Left in the settings folder from a launch until its window has settled.
 const MARKER: &str = "launch-pending";
-/// A DX12 startup failure was already recovered to OpenGL. Don't retry DX12 on every subsequent
-/// launch; clear this only when the user changes Window Graphics away from OpenGL.
+/// DX12 and Vulkan startup failures were already recovered to OpenGL. Don't retry GPU backends
+/// on every subsequent launch; clear this only when the user changes Window Graphics away from OpenGL.
 const GPU_FALLBACK_BLOCKED: &str = "gpu-fallback-blocked";
 /// One-time migration for an OpenGL preference left by previous versions' automatic crash recovery.
 const DX12_GL_REPAIR_ATTEMPTED: &str = "dx12-gl-repair-attempted";
@@ -114,7 +114,7 @@ impl Launch {
             if let Err(e) = std::fs::write(&repaired_path, "Migrated a previous automatic OpenGL fallback once.") {
                 log::warn!("saving the one-time DX12/OpenGL migration marker failed: {e}");
             }
-            notice = Some("OpenGL was active, which disables EffectCraft's GPU compositor. A compatible Intel DirectX 12 adapter was detected, so EffectCraft is switching Window Graphics to DirectX 12 to enable GPU compositing. If startup fails, it will recover to OpenGL instead of repeatedly retrying.".to_string());
+            notice = Some("OpenGL was active, which disables EffectCraft's GPU compositor. A compatible Intel DirectX 12 adapter was detected, so EffectCraft is switching Window Graphics to DirectX 12 to enable GPU compositing. If startup hangs, the watchdog retries with Vulkan, then OpenGL if necessary.".to_string());
         }
         let backends = match prefs.startup.window_graphics.as_str() {
             "dx12" => Some(Backends::DX12),
