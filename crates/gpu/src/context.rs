@@ -820,8 +820,6 @@ impl GpuContext {
         pollster::block_on(GpuContext::request()).map_err(|e| log::info!("gpu: {e}")).ok()
     }
 
-    /// Readbacks (GPU → CPU) are possible: waited for natively, or deferred (a browser
-    /// worker, [`crate::deferred`]). Impossible on the browser's main thread.
     /// Whether a kernel is available (Classic 3D and effect kernels may fall back to the CPU).
     pub(crate) fn has_kernel(&self, entry: &str) -> bool {
         self.pipelines.contains_key(entry)
