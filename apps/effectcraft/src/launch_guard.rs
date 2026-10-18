@@ -26,7 +26,7 @@ use eframe::wgpu::Backends;
 const MARKER: &str = "launch-pending";
 /// A DX12 startup failure was already recovered to OpenGL. Don't retry DX12 on every subsequent
 /// launch; clear this only when the user changes Window Graphics away from OpenGL.
-const DX12_FALLBACK_BLOCKED: &str = "dx12-fallback-blocked";
+const GPU_FALLBACK_BLOCKED: &str = "gpu-fallback-blocked";
 /// One-time migration for an OpenGL preference left by previous versions' automatic crash recovery.
 const DX12_GL_REPAIR_ATTEMPTED: &str = "dx12-gl-repair-attempted";
 
@@ -60,7 +60,7 @@ impl Launch {
         let prefs_path = dir.join(PREFS_FILE);
         let mut prefs = std::fs::read_to_string(&prefs_path).map(|t| Prefs::from_json(&t)).unwrap_or_default();
         let marker = dir.join(MARKER);
-        let blocked_path = dir.join(DX12_FALLBACK_BLOCKED);
+        let blocked_path = dir.join(GPU_FALLBACK_BLOCKED);
         let repaired_path = dir.join(DX12_GL_REPAIR_ATTEMPTED);
         // Choosing Automatic or DX12 again is an explicit user request to leave the recovery
         // fallback, so allow a fresh DX12 attempt.
@@ -75,30 +75,31 @@ impl Launch {
         if marker.exists()
             && !held
             && cfg!(not(target_os = "macos"))
-            && matches!(prefs.startup.window_graphics.as_str(), "auto" | "dx12")
+            && matches!(prefs.startup.window_graphics.as_str(), "auto" | "dx12" | "vulkan")
         {
-            // On affected Intel GPUs, Automatic first tries DX12 after a crash (Vulkan may fault
-            // in the vendor driver). If DX12 also fails, use OpenGL and suppress automatic retries.
+            // Recovery order on affected Intel hardware is DX12 -> Vulkan -> OpenGL. The startup
+            // watchdog restarts a renderer that hangs before creating the first window; the marker
+            // path handles crashes/errors that return control to the next launch.
             let previous = prefs.startup.window_graphics.clone();
-            let next = if prefs.startup.window_graphics == "auto" && cfg!(target_os = "windows") && prefer_dx12 {
-                "dx12"
-            } else {
-                "gl"
+            let next = match previous.as_str() {
+                "auto" if cfg!(target_os = "windows") && prefer_dx12 => "dx12",
+                "dx12" if cfg!(target_os = "windows") && prefer_dx12 => "vulkan",
+                _ => "gl",
             };
             prefs.startup.window_graphics = next.into();
             match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&prefs_path, prefs.to_json())) {
                 Ok(()) => log::warn!("the last launch stopped as its window opened: switching Window Graphics to {next}"),
                 Err(e) => log::warn!("the last launch stopped as its window opened; saving Window Graphics failed: {e}"),
             }
-            if next == "gl" && previous == "dx12" && prefer_dx12 {
-                if let Err(e) = std::fs::write(&blocked_path, "DX12 startup failed; retry after changing Window Graphics.") {
-                    log::warn!("saving DX12 fallback marker failed: {e}");
+            if next == "gl" && matches!(previous.as_str(), "dx12" | "vulkan") && prefer_dx12 {
+                if let Err(e) = std::fs::write(&blocked_path, "DX12/Vulkan startup failed; retry after changing Window Graphics.") {
+                    log::warn!("saving GPU fallback marker failed: {e}");
                 }
             }
-            notice = Some(if next == "dx12" {
-                "EffectCraft's last launch stopped as its window opened. It will retry with DirectX 12, avoiding the Intel Vulkan path (Settings ▸ Startup & Repair ▸ Window Graphics). If that also fails, the next launch will try OpenGL.".to_string()
-            } else {
-                "EffectCraft's last launch stopped as its window opened, so it will try OpenGL (Settings ▸ Startup & Repair ▸ Window Graphics). OpenGL disables the GPU compositor; change Window Graphics to Automatic or DirectX 12 to retry GPU acceleration after resolving the startup issue.".to_string()
+            notice = Some(match next {
+                "dx12" => "EffectCraft's last launch stopped before its window appeared. It will retry with DirectX 12. If it still hangs, automatic recovery will switch to Vulkan.".to_string(),
+                "vulkan" => "EffectCraft's DirectX 12 startup failed before the window appeared. It will retry with Vulkan for GPU compositing.".to_string(),
+                _ => "EffectCraft's DX12/Vulkan startup failed before the window appeared, so it will use OpenGL to restore a visible window. OpenGL disables the GPU compositor; change Window Graphics to Automatic or Vulkan after resolving the driver issue.".to_string(),
             });
         }
         // A previous version may have left the machine on OpenGL after its recovery logic. If a
@@ -122,6 +123,7 @@ impl Launch {
         }
         let backends = match prefs.startup.window_graphics.as_str() {
             "dx12" => Some(Backends::DX12),
+            "vulkan" => Some(Backends::VULKAN),
             "gl" => Some(Backends::GL),
             _ => None,
         };
