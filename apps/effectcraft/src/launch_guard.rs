@@ -27,6 +27,8 @@ const MARKER: &str = "launch-pending";
 /// A DX12 startup failure was already recovered to OpenGL. Don't retry DX12 on every subsequent
 /// launch; clear this only when the user changes Window Graphics away from OpenGL.
 const DX12_FALLBACK_BLOCKED: &str = "dx12-fallback-blocked";
+/// One-time migration for an OpenGL preference left by previous versions' automatic crash recovery.
+const DX12_GL_REPAIR_ATTEMPTED: &str = "dx12-gl-repair-attempted";
 
 /// How long the window keeps drawing after its first frame before the launch counts as made.
 /// A driver that fails as the window is shown and its surface re-created does so within the
@@ -59,6 +61,7 @@ impl Launch {
         let mut prefs = std::fs::read_to_string(&prefs_path).map(|t| Prefs::from_json(&t)).unwrap_or_default();
         let marker = dir.join(MARKER);
         let blocked_path = dir.join(DX12_FALLBACK_BLOCKED);
+        let repaired_path = dir.join(DX12_GL_REPAIR_ATTEMPTED);
         // Choosing Automatic or DX12 again is an explicit user request to leave the recovery
         // fallback, so allow a fresh DX12 attempt.
         if prefs.startup.window_graphics != "gl" && blocked_path.exists() {
@@ -105,11 +108,15 @@ impl Launch {
             && prefs.startup.window_graphics == "gl"
             && !marker.exists()
             && !blocked_path.exists()
+            && !repaired_path.exists()
         {
             prefs.startup.window_graphics = "dx12".into();
             match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&prefs_path, prefs.to_json())) {
                 Ok(()) => log::warn!("OpenGL was saved as Window Graphics on an Intel GPU with DX12 support; retrying DX12 for GPU compositing"),
                 Err(e) => log::warn!("saving the DX12 Window Graphics repair failed: {e}"),
+            }
+            if let Err(e) = std::fs::write(&repaired_path, "Migrated a previous automatic OpenGL fallback once.") {
+                log::warn!("saving the one-time DX12/OpenGL migration marker failed: {e}");
             }
             notice = Some("OpenGL was active, which disables EffectCraft's GPU compositor. A compatible Intel DirectX 12 adapter was detected, so EffectCraft is switching Window Graphics to DirectX 12 to enable GPU compositing. If startup fails, it will recover to OpenGL instead of repeatedly retrying.".to_string());
         }
@@ -200,6 +207,13 @@ mod tests {
         assert_eq!(window_graphics(&dir), "dx12");
         assert!(launch.notice.as_deref().is_some_and(|n| n.contains("GPU compositor")));
         launch.exited();
+
+        // A later deliberate OpenGL choice is respected; the legacy preference is migrated only once.
+        set_window_graphics(&dir, "gl");
+        let mut deliberate_gl = Launch::begin(Some(&dir), false, true);
+        assert_eq!(deliberate_gl.backends, Some(Backends::GL));
+        assert!(deliberate_gl.notice.is_none());
+        deliberate_gl.exited();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
