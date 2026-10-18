@@ -78,7 +78,7 @@ impl Launch {
             let previous = prefs.startup.window_graphics.clone();
             let next = match previous.as_str() {
                 "auto" if cfg!(target_os = "windows") && prefer_dx12 => "dx12",
-                "dx12" if cfg!(target_os = "windows") && prefer_dx12 => "vulkan",
+                "dx12" if cfg!(target_os = "windows") => "vulkan",
                 _ => "gl",
             };
             prefs.startup.window_graphics = next.into();
@@ -86,7 +86,7 @@ impl Launch {
                 Ok(()) => log::warn!("the last launch stopped as its window opened: switching Window Graphics to {next}"),
                 Err(e) => log::warn!("the last launch stopped as its window opened; saving Window Graphics failed: {e}"),
             }
-            if next == "gl" && matches!(previous.as_str(), "dx12" | "vulkan") && prefer_dx12 {
+            if next == "gl" && matches!(previous.as_str(), "dx12" | "vulkan") && cfg!(target_os = "windows") {
                 if let Err(e) = std::fs::write(&blocked_path, "DX12/Vulkan startup failed; retry after changing Window Graphics.") {
                     log::warn!("saving GPU fallback marker failed: {e}");
                 }
