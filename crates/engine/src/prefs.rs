@@ -129,9 +129,8 @@ page!(Startup {
     show_home_on_open_project: bool = false,
     /// After a crash, offer to open the most recent auto-save.
     offer_crash_recovery: bool = true,
-    /// What the desktop window draws with, from the next launch: `auto` (the platform's best
-    /// graphics API) or `gl` (OpenGL, for drivers that crash with the others). A launch that
-    /// stops as its window opens switches it to `gl` (#243).
+    /// What the desktop window draws with, from the next launch: `auto`, `dx12`, `vulkan`
+    /// or `gl`. When graphics initialization hangs, startup recovery tries Vulkan, then OpenGL.
     window_graphics: String = "auto".into(),
 });
 
