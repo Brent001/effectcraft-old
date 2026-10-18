@@ -512,6 +512,7 @@ fn disable_app_nap() {
 #[cfg(test)]
 mod tests {
     use super::{Args, parse_args};
+    use std::env::VarError;
 
     #[cfg(target_os = "windows")]
     #[test]
@@ -520,7 +521,6 @@ mod tests {
         assert!(super::intel_gen9_to_gen11(0x3e9b));
         assert!(!super::intel_gen9_to_gen11(0x46a6));
     }
-    use std::env::VarError;
 
     fn parse_env(args: &[&str], env_port: Result<String, VarError>) -> Result<Option<Args>, String> {
         parse_args(args.iter().map(|a| a.to_string()), env_port)
