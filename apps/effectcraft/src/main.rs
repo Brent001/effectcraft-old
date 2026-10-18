@@ -173,6 +173,7 @@ fn start_startup_watchdog(
     step: u8,
     args: Vec<std::ffi::OsString>,
     config_dir: Option<std::path::PathBuf>,
+    fallback: &'static str,
 ) {
     if step >= 2 {
         return;
@@ -183,9 +184,18 @@ fn start_startup_watchdog(
             return;
         }
 
-        let fallback = if step == 0 { "vulkan" } else { "gl" };
         if let Err(error) = save_window_graphics_preference(config_dir.as_deref(), fallback) {
             log::warn!("startup watchdog could not save the {fallback} fallback: {error}");
+        }
+        if fallback == "gl" {
+            if let Some(dir) = config_dir.as_deref()
+                && let Err(error) = std::fs::write(
+                    dir.join("gpu-fallback-blocked"),
+                    "DX12/Vulkan startup stalled; retry after changing Window Graphics.",
+                )
+            {
+                log::warn!("startup watchdog could not save the GPU fallback marker: {error}");
+            }
         }
         log::error!(
             "no eframe app/window was created within {:?}; restarting EffectCraft with {fallback}",
@@ -280,13 +290,20 @@ fn main() -> eframe::Result {
         });
         let should_watch = recovery_step < 2
             && !externally_overridden
-            && (recovery_backend.is_some() || preference != "gl" || migration_pending);
+            && (recovery_backend.as_deref() == Some("vulkan")
+                || (recovery_backend.is_none() && (preference != "gl" || migration_pending)));
         if should_watch {
+            let fallback = if recovery_backend.as_deref() == Some("vulkan") || preference == "vulkan" {
+                "gl"
+            } else {
+                "vulkan"
+            };
             start_startup_watchdog(
                 startup_ready.clone(),
                 recovery_step,
                 std::env::args_os().skip(1).collect(),
                 dir,
+                fallback,
             );
         }
     }
