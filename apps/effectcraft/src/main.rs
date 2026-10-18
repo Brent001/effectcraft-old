@@ -154,8 +154,8 @@ fn main() -> eframe::Result {
     // Wayland shows the window's icon from its desktop entry: an AppImage brings its own.
     #[cfg(target_os = "linux")]
     appimage::integrate_from_env(ICON_PNG);
-    // Settings ▸ Startup & Repair ▸ Window Graphics, switched to OpenGL when the last launch
-    // stopped as its window opened (a crashing graphics driver, #243).
+    // Settings ▸ Startup & Repair ▸ Window Graphics: prefer DX12 on affected Intel hardware,
+    // and retry DX12 before the OpenGL compatibility fallback after a failed launch (#243).
     #[cfg(target_os = "windows")]
     let prefer_dx12 = use_dx12_for_affected_intel();
     #[cfg(not(target_os = "windows"))]
