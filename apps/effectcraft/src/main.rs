@@ -156,7 +156,15 @@ fn main() -> eframe::Result {
     appimage::integrate_from_env(ICON_PNG);
     // Settings ▸ Startup & Repair ▸ Window Graphics, switched to OpenGL when the last launch
     // stopped as its window opened (a crashing graphics driver, #243).
-    let mut launch = launch_guard::Launch::begin(effectcraft_host::config_dir().as_deref(), std::env::var_os("WGPU_BACKEND").is_some());
+    #[cfg(target_os = "windows")]
+    let prefer_dx12 = use_dx12_for_affected_intel();
+    #[cfg(not(target_os = "windows"))]
+    let prefer_dx12 = false;
+    let mut launch = launch_guard::Launch::begin(
+        effectcraft_host::config_dir().as_deref(),
+        std::env::var_os("WGPU_BACKEND").is_some(),
+        prefer_dx12,
+    );
     let on_gl = launch.backends == Some(eframe::wgpu::Backends::GL);
     let notice = launch.notice.take();
     let options = eframe::NativeOptions {
@@ -171,7 +179,7 @@ fn main() -> eframe::Result {
             // Wayland matches the window to `ai.storyteller.effectcraft.desktop` by this ID.
             .with_app_id(appimage::APP_ID),
         event_loop_builder: agent_event_loop(control_port.is_some()),
-        wgpu_options: wgpu_options(launch.backends),
+        wgpu_options: wgpu_options(launch.backends, prefer_dx12),
         ..Default::default()
     };
     // Start-up milestones go to stderr and the session log, so a window that never appears
@@ -374,15 +382,9 @@ fn use_dx12_for_affected_intel() -> bool {
     found
 }
 
-fn wgpu_options(backends: Option<eframe::wgpu::Backends>) -> eframe::WgpuConfiguration {
+fn wgpu_options(backends: Option<eframe::wgpu::Backends>, prefer_dx12: bool) -> eframe::WgpuConfiguration {
     use eframe::egui_wgpu::WgpuSetup;
-    let effective_backends = backends.or_else(|| {
-        #[cfg(target_os = "windows")]
-        if use_dx12_for_affected_intel() {
-            return Some(eframe::wgpu::Backends::DX12);
-        }
-        None
-    });
+    let effective_backends = backends.or_else(|| prefer_dx12.then_some(eframe::wgpu::Backends::DX12));
     let mut config = eframe::WgpuConfiguration::default();
     if let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
         if let Some(b) = effective_backends {
@@ -549,7 +551,7 @@ mod tests {
         if std::env::var_os("WGPU_VALIDATION_INDIRECT_CALL").is_some() {
             return;
         }
-        let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = super::wgpu_options(None).wgpu_setup else {
+        let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = super::wgpu_options(None, false).wgpu_setup else {
             panic!("the default setup creates its own instance");
         };
         // Intel Metal can't compile the validation's compute shader, and the device is lost.
