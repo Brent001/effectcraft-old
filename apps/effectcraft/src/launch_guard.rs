@@ -186,6 +186,7 @@ mod tests {
         Prefs::from_json(&std::fs::read_to_string(dir.join(PREFS_FILE)).unwrap_or_default()).startup.window_graphics
     }
 
+    #[cfg(target_os = "windows")]
     fn set_window_graphics(dir: &Path, value: &str) {
         let _ = std::fs::create_dir_all(dir);
         let mut prefs = Prefs::from_json(&std::fs::read_to_string(dir.join(PREFS_FILE)).unwrap_or_default());
@@ -194,6 +195,7 @@ mod tests {
     }
 
     /// A stale OpenGL selection on affected Intel hardware is repaired to DX12 when available.
+    #[cfg(target_os = "windows")]
     #[test]
     fn saved_opengl_is_repaired_to_dx12_when_compatible() {
         let dir = std::env::temp_dir().join(format!("ec-launch-guard-repair-{}", std::process::id()));
@@ -215,6 +217,7 @@ mod tests {
     }
 
     /// DX12 then Vulkan are tried before the safe OpenGL fallback; changing settings permits retries.
+    #[cfg(target_os = "windows")]
     #[test]
     fn dx12_recovery_tries_vulkan_then_blocks_retries_after_vulkan_fails() {
         let dir = std::env::temp_dir().join(format!("ec-launch-guard-block-{}", std::process::id()));
