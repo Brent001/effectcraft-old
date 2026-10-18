@@ -343,11 +343,49 @@ fn main() -> eframe::Result {
 /// instead of eframe's fixed set: an older GPU that can't meet those (Intel HD Graphics 5500,
 /// #198) still opens the app, and the compositor then checks what it needs and falls back to
 /// the CPU when the device can't run it. `backends`: Window Graphics' choice, when it makes one.
+/// Intel Gen 9–11 integrated GPU device IDs whose Vulkan drivers are known to be fragile
+/// in this compositor. Device IDs are PCI IDs (the Intel HD Graphics 520 is 0x1916).
+#[cfg(target_os = "windows")]
+fn intel_gen9_to_gen11(device: u32) -> bool {
+    matches!(device >> 8, 0x19 | 0x1a | 0x31 | 0x3e | 0x45 | 0x4e | 0x59 | 0x5a | 0x87 | 0x8a | 0x9b)
+        || device == 0x0a84
+}
+
+/// Probe DirectX 12 only, without initialising Vulkan. On affected Intel hardware this lets
+/// EffectCraft choose DX12 before the known Intel Vulkan driver can crash during adapter/device
+/// creation. An explicit WGPU_BACKEND remains authoritative.
+#[cfg(target_os = "windows")]
+fn use_dx12_for_affected_intel() -> bool {
+    if std::env::var_os("WGPU_BACKEND").is_some() {
+        return false;
+    }
+    let mut descriptor = eframe::wgpu::InstanceDescriptor::new_without_display_handle();
+    descriptor.backends = eframe::wgpu::Backends::DX12;
+    let instance = eframe::wgpu::Instance::new(descriptor);
+    let found = instance.enumerate_adapters(eframe::wgpu::Backends::DX12).iter().any(|adapter| {
+        let info = adapter.get_info();
+        info.vendor == 0x8086
+            && info.device_type == eframe::wgpu::DeviceType::IntegratedGpu
+            && intel_gen9_to_gen11(info.device)
+    });
+    if found {
+        log::warn!("affected Intel integrated graphics detected; preferring DirectX 12 over the Intel Vulkan path");
+    }
+    found
+}
+
 fn wgpu_options(backends: Option<eframe::wgpu::Backends>) -> eframe::WgpuConfiguration {
     use eframe::egui_wgpu::WgpuSetup;
+    let effective_backends = backends.or_else(|| {
+        #[cfg(target_os = "windows")]
+        if use_dx12_for_affected_intel() {
+            return Some(eframe::wgpu::Backends::DX12);
+        }
+        None
+    });
     let mut config = eframe::WgpuConfiguration::default();
     if let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
-        if let Some(b) = backends {
+        if let Some(b) = effective_backends {
             setup.instance_descriptor.backends = b;
         }
         // Nothing draws or dispatches indirectly, so wgpu's check of indirect arguments only costs
@@ -472,6 +510,14 @@ fn disable_app_nap() {
 #[cfg(test)]
 mod tests {
     use super::{Args, parse_args};
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn intel_device_picker_recognises_hd_520() {
+        assert!(super::intel_gen9_to_gen11(0x1916));
+        assert!(super::intel_gen9_to_gen11(0x3e9b));
+        assert!(!super::intel_gen9_to_gen11(0x46a6));
+    }
     use std::env::VarError;
 
     fn parse_env(args: &[&str], env_port: Result<String, VarError>) -> Result<Option<Args>, String> {
