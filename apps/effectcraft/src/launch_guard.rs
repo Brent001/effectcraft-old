@@ -6,11 +6,11 @@
 //! a Radeon RX 6800M, Adrenalin 26.9.2: an access violation in amdvlk64.dll on every launch).
 //! A crash in a driver can't be caught, so each launch leaves a marker in the settings folder
 //! until its window has kept drawing for [`SETTLE`] (or the app quits normally before then). A
-//! launch that finds the previous one's marker switches Window Graphics to OpenGL, which those
-//! drivers run, and says so once the window is up. `WGPU_BACKEND` (wgpu's own override) still
-//! wins over both. The marker is locked while its launch runs, so a second copy opened meanwhile
-//! isn't taken for a crash; and a window OpenGL can't open either puts Window Graphics back to
-//! Automatic ([`opengl_failed`]) rather than failing every launch.
+//! launch that finds the previous one's marker on affected Intel Windows hardware tries
+//! DirectX 12 first, then OpenGL if DX12 also fails; elsewhere it tries OpenGL. `WGPU_BACKEND`
+//! (wgpu's own override) still wins. The marker is locked while its launch runs, so a second copy
+//! opened meanwhile isn't taken for a crash; and a window OpenGL can't open either puts Window
+//! Graphics back to Automatic ([`opengl_failed`]) rather than failing every launch.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
