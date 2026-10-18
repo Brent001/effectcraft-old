@@ -83,7 +83,9 @@ impl Launch {
             // path handles crashes/errors that return control to the next launch.
             let previous = prefs.startup.window_graphics.clone();
             let next = match previous.as_str() {
-                "auto" if cfg!(target_os = "windows") && prefer_dx12 => "dx12",
+                // In this app, Automatic is also forced to DX12 by prefer_dx12. If that
+                // startup left a marker, the next attempt must be Vulkan, not DX12 again.
+                "auto" if cfg!(target_os = "windows") && prefer_dx12 => "vulkan",
                 "dx12" if cfg!(target_os = "windows") => "vulkan",
                 _ => "gl",
             };
@@ -99,7 +101,7 @@ impl Launch {
             }
             notice = Some(match next {
                 "dx12" => "EffectCraft's last launch stopped before its window appeared. It will retry with DirectX 12. If it still hangs, automatic recovery will switch to Vulkan.".to_string(),
-                "vulkan" => "EffectCraft's DirectX 12 startup failed before the window appeared. It will retry with Vulkan for GPU compositing.".to_string(),
+                "vulkan" => "EffectCraft's previous graphics startup failed before the window appeared. It will retry with Vulkan for GPU compositing.".to_string(),
                 _ => "EffectCraft's DX12/Vulkan startup failed before the window appeared, so it will use OpenGL to restore a visible window. OpenGL disables the GPU compositor; change Window Graphics to Automatic or Vulkan after resolving the driver issue.".to_string(),
             });
         }
@@ -297,23 +299,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// On affected Intel Windows hardware, failed startup recovery tries DX12, then Vulkan, then OpenGL.
+    /// A failed Automatic/DX12 launch on affected Intel Windows hardware falls back to Vulkan, then OpenGL.
     #[cfg(target_os = "windows")]
     #[test]
-    fn affected_intel_retries_dx12_then_vulkan_then_opengl() {
+    fn affected_intel_recovers_automatic_to_vulkan_then_opengl() {
         let dir = std::env::temp_dir().join(format!("ec-launch-guard-dx12-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // First attempt was Automatic and stopped before drawing.
+        // Automatic uses DX12 on this hardware; it stopped before drawing.
         drop(Launch::begin(Some(&dir), false, true));
-        let dx12 = Launch::begin(Some(&dir), false, true);
-        assert_eq!(dx12.backends, Some(Backends::DX12));
-        assert!(dx12.notice.as_deref().is_some_and(|n| n.contains("DirectX 12")));
-        assert_eq!(window_graphics(&dir), "dx12");
-
-        // DX12 failed: try Vulkan for compute compositing.
-        drop(dx12);
         let vulkan = Launch::begin(Some(&dir), false, true);
         assert_eq!(vulkan.backends, Some(Backends::VULKAN));
+        assert!(vulkan.notice.as_deref().is_some_and(|n| n.contains("Vulkan")));
         assert_eq!(window_graphics(&dir), "vulkan");
 
         // Vulkan failed too: restore the visible-window OpenGL fallback.
