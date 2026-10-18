@@ -56,12 +56,18 @@ impl Launch {
         let mut prefs = std::fs::read_to_string(&prefs_path).map(|t| Prefs::from_json(&t)).unwrap_or_default();
         let marker = dir.join(MARKER);
         let blocked_path = dir.join(GPU_FALLBACK_BLOCKED);
+        // Migration from the previous release's marker name.
+        let legacy_blocked_path = dir.join("dx12-fallback-blocked");
         let repaired_path = dir.join(DX12_GL_REPAIR_ATTEMPTED);
         // Choosing Automatic, DX12 or Vulkan again is an explicit user request to leave the recovery
-        // fallback, so allow a fresh DX12 attempt.
-        if prefs.startup.window_graphics != "gl" && blocked_path.exists() {
-            if let Err(e) = std::fs::remove_file(&blocked_path) {
-                log::warn!("removing GPU fallback marker failed: {e}");
+        // fallback, so allow a fresh GPU-backend attempt.
+        if prefs.startup.window_graphics != "gl" {
+            for path in [&blocked_path, &legacy_blocked_path] {
+                if path.exists()
+                    && let Err(e) = std::fs::remove_file(path)
+                {
+                    log::warn!("removing GPU fallback marker failed: {e}");
+                }
             }
         }
         // Locked by another launch that is still opening its window: not a crash.
@@ -104,6 +110,7 @@ impl Launch {
             && prefs.startup.window_graphics == "gl"
             && !marker.exists()
             && !blocked_path.exists()
+            && !legacy_blocked_path.exists()
             && !repaired_path.exists()
         {
             prefs.startup.window_graphics = "dx12".into();
