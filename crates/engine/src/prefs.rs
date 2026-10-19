@@ -43,6 +43,7 @@ pub const LANGUAGES: &[(&str, &str)] = &[
 pub const WINDOW_GRAPHICS: &[(&str, &str)] = &[
     ("Automatic", "auto"),
     ("DirectX 12 (compatibility)", "dx12"),
+    ("Vulkan (experimental)", "vulkan"),
     ("OpenGL (compatibility)", "gl"),
 ];
 #[cfg(not(target_os = "windows"))]
@@ -129,8 +130,8 @@ page!(Startup {
     /// After a crash, offer to open the most recent auto-save.
     offer_crash_recovery: bool = true,
     /// What the desktop window draws with, from the next launch: `auto` (the platform's best
-    /// graphics API) or `gl` (OpenGL, for drivers that crash with the others). A launch that
-    /// stops as its window opens switches it to `gl` (#243).
+    /// graphics API), `dx12`, `vulkan` or `gl` (OpenGL, for drivers that crash with the others).
+    /// On affected Intel Windows GPUs, startup recovery tries DX12, then Vulkan, then OpenGL.
     window_graphics: String = "auto".into(),
 });
 
