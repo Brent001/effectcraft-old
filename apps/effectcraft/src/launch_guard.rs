@@ -55,15 +55,25 @@ pub struct Launch {
 
 impl Launch {
     /// Read Window Graphics in the settings folder `dir`, recover from a failed launch, and
-    /// leave this launch's marker. `prefer_dx12` is true when affected Intel hardware has a
-    /// usable DX12 adapter. `env_override`: `WGPU_BACKEND` is set.
-    pub fn begin(dir: Option<&Path>, env_override: bool, prefer_dx12: bool) -> Launch {
+    /// leave this launch's marker. The preference flags come from available Intel adapters.
+    /// `env_override`: `WGPU_BACKEND` is set.
+    pub fn begin(dir: Option<&Path>, env_override: bool, prefer_dx12: bool, prefer_vulkan: bool) -> Launch {
         let Some(dir) = dir.filter(|_| !env_override) else { return Launch::default() };
         let prefs_path = dir.join(PREFS_FILE);
         let mut prefs = std::fs::read_to_string(&prefs_path).map(|t| Prefs::from_json(&t)).unwrap_or_default();
         let marker = dir.join(MARKER);
         let blocked_path = dir.join(DX12_FALLBACK_BLOCKED);
         let repaired_path = dir.join(DX12_GL_REPAIR_ATTEMPTED);
+        // If the HD 520's driver exposes Vulkan, don't try the DX12 setting that leaves this
+        // machine with a background-only process. Apply this before creating the window; explicit
+        // WGPU_BACKEND environment overrides are handled by returning above.
+        if prefer_vulkan && prefs.startup.window_graphics == "dx12" && !marker.exists() {
+            prefs.startup.window_graphics = "vulkan".into();
+            match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&prefs_path, prefs.to_json())) {
+                Ok(()) => log::warn!("redirecting the saved DX12 selection to Vulkan on Intel HD Graphics 520"),
+                Err(e) => log::warn!("saving the Vulkan Window Graphics selection failed: {e}"),
+            }
+        }
         // Choosing Automatic or DX12 again is an explicit user request to leave the recovery
         // fallback, so allow a fresh DX12 attempt.
         if prefs.startup.window_graphics != "gl" && blocked_path.exists() {
@@ -84,10 +94,18 @@ impl Launch {
             // setting. This gives HD 520-class adapters another compute-capable path without
             // allowing a repeating driver-crash loop.
             let previous = prefs.startup.window_graphics.clone();
-            let next = if prefs.startup.window_graphics == "auto" && cfg!(target_os = "windows") && prefer_dx12 {
-                "dx12"
-            } else if prefs.startup.window_graphics == "dx12" && cfg!(target_os = "windows") && prefer_dx12 {
+            let next = if prefs.startup.window_graphics == "dx12" && cfg!(target_os = "windows") {
+                // A manually selected DX12 backend did not finish opening. Try Vulkan rather than
+                // reproducing the invisible-background-process failure on the next launch.
                 "vulkan"
+            } else if prefs.startup.window_graphics == "auto" && cfg!(target_os = "windows") && prefer_dx12 {
+                // Automatic mode forced DX12 for this adapter, so it has already been tested.
+                // Do not waste another launch repeating the same backend.
+                "vulkan"
+            } else if prefs.startup.window_graphics == "auto" && cfg!(target_os = "windows") && prefer_vulkan {
+                // Vulkan was the automatic choice on HD 520. If it fails, prefer a visible OpenGL
+                // window over retrying the same backend after a startup failure.
+                "gl"
             } else {
                 "gl"
             };
@@ -118,7 +136,7 @@ impl Launch {
         // If the crash marker says OpenGL was an automatic fallback, try Vulkan once on affected
         // Intel systems; keep the guard marker so another driver crash falls back safely.
         let vulkan_repaired_path = dir.join(VULKAN_GL_REPAIR_ATTEMPTED);
-        if prefer_dx12
+        if (prefer_dx12 || prefer_vulkan)
             && prefs.startup.window_graphics == "gl"
             && !marker.exists()
             && blocked_path.exists()
@@ -138,22 +156,34 @@ impl Launch {
             notice = Some("OpenGL was left active after a previous DirectX 12 startup failure, which disables GPU compositing. EffectCraft will try Vulkan once for GPU acceleration; if it also fails, it will safely return to OpenGL.".to_string());
         }
         // Preserve the older one-time repair for installations without a recorded DX12 crash.
-        if prefer_dx12
+        if (prefer_dx12 || prefer_vulkan)
             && prefs.startup.window_graphics == "gl"
             && !marker.exists()
             && !blocked_path.exists()
-            && !repaired_path.exists()
+            && (!repaired_path.exists() || prefer_vulkan)
             && !vulkan_repaired_path.exists()
         {
-            prefs.startup.window_graphics = "dx12".into();
-            match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&prefs_path, prefs.to_json())) {
-                Ok(()) => log::warn!("OpenGL was saved as Window Graphics on an Intel GPU with DX12 support; retrying DX12 for GPU compositing"),
-                Err(e) => log::warn!("saving the DX12 Window Graphics repair failed: {e}"),
+            if prefer_vulkan {
+                prefs.startup.window_graphics = "vulkan".into();
+                match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&prefs_path, prefs.to_json())) {
+                    Ok(()) => log::warn!("OpenGL was saved as Window Graphics on Intel HD 520; retrying Vulkan for GPU compositing"),
+                    Err(e) => log::warn!("saving the Vulkan Window Graphics repair failed: {e}"),
+                }
+                if let Err(e) = std::fs::write(&vulkan_repaired_path, "Migrated a previous automatic OpenGL fallback to Vulkan once.") {
+                    log::warn!("saving the one-time Vulkan/OpenGL migration marker failed: {e}");
+                }
+                notice = Some("OpenGL was active, which disables EffectCraft's GPU compositor. An Intel HD Graphics 520 Vulkan adapter was detected, so EffectCraft is switching to Vulkan for GPU compositing. If that fails, it will keep a visible OpenGL fallback.".to_string());
+            } else {
+                prefs.startup.window_graphics = "dx12".into();
+                match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&prefs_path, prefs.to_json())) {
+                    Ok(()) => log::warn!("OpenGL was saved as Window Graphics on an Intel GPU with DX12 support; retrying DX12 for GPU compositing"),
+                    Err(e) => log::warn!("saving the DX12 Window Graphics repair failed: {e}"),
+                }
+                if let Err(e) = std::fs::write(&repaired_path, "Migrated a previous automatic OpenGL fallback once.") {
+                    log::warn!("saving the one-time DX12/OpenGL migration marker failed: {e}");
+                }
+                notice = Some("OpenGL was active, which disables EffectCraft's GPU compositor. A compatible Intel DirectX 12 adapter was detected, so EffectCraft is switching Window Graphics to DirectX 12 to enable GPU compositing. If startup fails, it will try Vulkan once before recovering to OpenGL.".to_string());
             }
-            if let Err(e) = std::fs::write(&repaired_path, "Migrated a previous automatic OpenGL fallback once.") {
-                log::warn!("saving the one-time DX12/OpenGL migration marker failed: {e}");
-            }
-            notice = Some("OpenGL was active, which disables EffectCraft's GPU compositor. A compatible Intel DirectX 12 adapter was detected, so EffectCraft is switching Window Graphics to DirectX 12 to enable GPU compositing. If startup fails, it will try Vulkan once before recovering to OpenGL.".to_string());
         }
         let backends = match prefs.startup.window_graphics.as_str() {
             "dx12" => Some(Backends::DX12),
@@ -238,7 +268,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ec-launch-guard-repair-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         set_window_graphics(&dir, "gl");
-        let mut launch = Launch::begin(Some(&dir), false, true);
+        let mut launch = Launch::begin(Some(&dir), false, true, false);
         assert_eq!(launch.backends, Some(Backends::DX12));
         assert_eq!(window_graphics(&dir), "dx12");
         assert!(launch.notice.as_deref().is_some_and(|n| n.contains("GPU compositor")));
@@ -246,7 +276,7 @@ mod tests {
 
         // A later deliberate OpenGL choice is respected; the legacy preference is migrated only once.
         set_window_graphics(&dir, "gl");
-        let mut deliberate_gl = Launch::begin(Some(&dir), false, true);
+        let mut deliberate_gl = Launch::begin(Some(&dir), false, true, false);
         assert_eq!(deliberate_gl.backends, Some(Backends::GL));
         assert!(deliberate_gl.notice.is_none());
         deliberate_gl.exited();
@@ -261,32 +291,65 @@ mod tests {
         set_window_graphics(&dir, "dx12");
 
         // DX12 failed while the previous launch was opening: try Vulkan instead of going straight to GL.
-        drop(Launch::begin(Some(&dir), false, true));
-        let mut vulkan = Launch::begin(Some(&dir), false, true);
+        drop(Launch::begin(Some(&dir), false, true, false));
+        let mut vulkan = Launch::begin(Some(&dir), false, true, false);
         assert_eq!(vulkan.backends, Some(Backends::VULKAN));
         assert_eq!(window_graphics(&dir), "vulkan");
         assert!(vulkan.notice.as_deref().is_some_and(|n| n.contains("try Vulkan")));
         vulkan.exited();
 
         // Vulkan failed too: recover to GL and permanently stop automatic retries until the user changes the setting.
-        drop(Launch::begin(Some(&dir), false, true));
-        let mut fallback = Launch::begin(Some(&dir), false, true);
+        drop(Launch::begin(Some(&dir), false, true, false));
+        let mut fallback = Launch::begin(Some(&dir), false, true, false);
         assert_eq!(fallback.backends, Some(Backends::GL));
         assert!(fallback.notice.as_deref().is_some_and(|n| n.contains("OpenGL disables")));
         assert!(dir.join(DX12_FALLBACK_BLOCKED).exists());
         assert!(dir.join(VULKAN_GL_REPAIR_ATTEMPTED).exists());
         fallback.exited();
 
-        let mut safe = Launch::begin(Some(&dir), false, true);
+        let mut safe = Launch::begin(Some(&dir), false, true, false);
         assert_eq!(safe.backends, Some(Backends::GL), "don't retry a backend that failed during startup");
         assert!(safe.notice.is_none());
         safe.exited();
 
         set_window_graphics(&dir, "auto");
-        let mut retry = Launch::begin(Some(&dir), false, true);
+        let mut retry = Launch::begin(Some(&dir), false, true, false);
         assert_eq!(retry.backends, None);
         assert!(!dir.join(DX12_FALLBACK_BLOCKED).exists(), "changing the preference permits a new attempt");
         retry.exited();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_dx12_is_redirected_to_vulkan_on_hd520() {
+        let dir = std::env::temp_dir().join(format!("ec-launch-guard-hd520-dx12-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        set_window_graphics(&dir, "dx12");
+
+        let mut launch = Launch::begin(Some(&dir), false, false, true);
+        assert_eq!(launch.backends, Some(Backends::VULKAN));
+        assert_eq!(window_graphics(&dir), "vulkan");
+        launch.exited();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_opengl_is_repaired_to_vulkan_on_hd520() {
+        let dir = std::env::temp_dir().join(format!("ec-launch-guard-hd520-gl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        set_window_graphics(&dir, "gl");
+
+        let mut retry = Launch::begin(Some(&dir), false, false, true);
+        assert_eq!(retry.backends, Some(Backends::VULKAN));
+        assert_eq!(window_graphics(&dir), "vulkan");
+        assert!(retry.notice.as_deref().is_some_and(|n| n.contains("Vulkan")));
+        retry.exited();
+
+        // Do not automatically re-run migration if the user deliberately selects OpenGL again.
+        set_window_graphics(&dir, "gl");
+        let mut deliberate_gl = Launch::begin(Some(&dir), false, false, true);
+        assert_eq!(deliberate_gl.backends, Some(Backends::GL));
+        deliberate_gl.exited();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -298,7 +361,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(DX12_FALLBACK_BLOCKED), "previous DX12 failure").unwrap();
 
-        let mut retry = Launch::begin(Some(&dir), false, true);
+        let mut retry = Launch::begin(Some(&dir), false, false, true);
         assert_eq!(retry.backends, Some(Backends::VULKAN));
         assert_eq!(window_graphics(&dir), "vulkan");
         assert!(!dir.join(DX12_FALLBACK_BLOCKED).exists());
@@ -307,7 +370,7 @@ mod tests {
 
         // The repair marker keeps a deliberate later OpenGL choice from automatically changing again.
         set_window_graphics(&dir, "gl");
-        let mut safe = Launch::begin(Some(&dir), false, true);
+        let mut safe = Launch::begin(Some(&dir), false, true, false);
         assert_eq!(safe.backends, Some(Backends::GL));
         assert!(safe.notice.is_none());
         safe.exited();
@@ -321,7 +384,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         // A first launch that draws: nothing changes. Its first frames don't settle it (a driver
         // may still crash as the window is shown); frames for `SETTLE` do.
-        let mut l = Launch::begin(Some(&dir), false, false);
+        let mut l = Launch::begin(Some(&dir), false, false, false);
         assert_eq!((l.backends, l.notice.is_some()), (None, false));
         assert!(dir.join(MARKER).exists());
         let t0 = Instant::now();
@@ -332,9 +395,9 @@ mod tests {
         assert!(!dir.join(MARKER).exists());
         assert_eq!(l.frame_drawn_at(t0 + SETTLE), None, "settled stays settled");
         // A launch that crashes before drawing (it never calls `drawn`)…
-        drop(Launch::begin(Some(&dir), false, false));
+        drop(Launch::begin(Some(&dir), false, false, false));
         // …makes the next one use OpenGL and say so, once.
-        let mut l = Launch::begin(Some(&dir), false, false);
+        let mut l = Launch::begin(Some(&dir), false, false, false);
         if cfg!(target_os = "macos") {
             assert_eq!((l.backends, l.notice.is_some()), (None, false), "no OpenGL on macOS");
         } else {
@@ -342,38 +405,32 @@ mod tests {
             assert!(l.notice.is_some());
             assert_eq!(window_graphics(&dir), "gl", "saved in Settings");
             l.exited();
-            let l = Launch::begin(Some(&dir), false, false);
+            let l = Launch::begin(Some(&dir), false, false, false);
             assert_eq!((l.backends, l.notice.is_some()), (Some(Backends::GL), false), "it stays, without the notice");
         }
         // `WGPU_BACKEND` wins, and leaves no marker.
         let _ = std::fs::remove_file(dir.join(MARKER));
-        assert_eq!(Launch::begin(Some(&dir), true, false).backends, None);
+        assert_eq!(Launch::begin(Some(&dir), true, false, false).backends, None);
         assert!(!dir.join(MARKER).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// On affected Intel Windows hardware, a failed Automatic launch retries DX12, then Vulkan, then OpenGL.
+    /// On affected Intel Windows hardware, a failed Automatic DX12 launch goes straight to Vulkan.
     #[cfg(target_os = "windows")]
     #[test]
-    fn affected_intel_retries_dx12_then_vulkan_before_opengl() {
+    fn affected_intel_falls_back_from_automatic_dx12_to_vulkan() {
         let dir = std::env::temp_dir().join(format!("ec-launch-guard-dx12-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // First attempt was Automatic and crashed before drawing.
-        drop(Launch::begin(Some(&dir), false, true));
-        let dx12 = Launch::begin(Some(&dir), false, true);
-        assert_eq!(dx12.backends, Some(Backends::DX12));
-        assert!(dx12.notice.as_deref().is_some_and(|n| n.contains("DirectX 12")));
-        assert_eq!(window_graphics(&dir), "dx12");
-
-        // DX12 also failed: try Vulkan instead of immediately disabling the compositor.
-        drop(dx12);
-        let vulkan = Launch::begin(Some(&dir), false, true);
+        set_window_graphics(&dir, "auto");
+        // Automatic mode forces DX12 for affected Intel adapters; simulate it stopping before a frame.
+        drop(Launch::begin(Some(&dir), false, true, false));
+        let vulkan = Launch::begin(Some(&dir), false, true, false);
         assert_eq!(vulkan.backends, Some(Backends::VULKAN));
         assert_eq!(window_graphics(&dir), "vulkan");
 
-        // Vulkan failed too: recover to OpenGL rather than repeating driver startup crashes.
+        // Vulkan fails too: fall back to OpenGL rather than repeating a driver startup crash.
         drop(vulkan);
-        let gl = Launch::begin(Some(&dir), false, true);
+        let gl = Launch::begin(Some(&dir), false, true, false);
         assert_eq!(gl.backends, Some(Backends::GL));
         assert_eq!(window_graphics(&dir), "gl");
         assert!(dir.join(DX12_FALLBACK_BLOCKED).exists());
@@ -388,10 +445,10 @@ mod tests {
     fn a_launch_that_stops_after_its_first_frame_switches_the_next_to_opengl() {
         let dir = std::env::temp_dir().join(format!("ec-launch-guard-3-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut l = Launch::begin(Some(&dir), false, false);
+        let mut l = Launch::begin(Some(&dir), false, false, false);
         assert!(l.frame_drawn().is_some());
         drop(l);
-        let l = Launch::begin(Some(&dir), false, false);
+        let l = Launch::begin(Some(&dir), false, false, false);
         if cfg!(target_os = "macos") {
             assert_eq!(l.backends, None, "no OpenGL on macOS");
         } else {
@@ -401,11 +458,11 @@ mod tests {
         drop(l);
         let _ = std::fs::remove_dir_all(&dir);
         // Quitting right after the window opened leaves no marker.
-        let mut l = Launch::begin(Some(&dir), false, false);
+        let mut l = Launch::begin(Some(&dir), false, false, false);
         assert!(l.frame_drawn().is_some());
         l.exited();
         assert!(!dir.join(MARKER).exists());
-        assert_eq!(Launch::begin(Some(&dir), false, false).backends, None);
+        assert_eq!(Launch::begin(Some(&dir), false, false, false).backends, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -415,15 +472,15 @@ mod tests {
     fn a_second_copy_or_failed_opengl_doesnt_strand_window_graphics() {
         let dir = std::env::temp_dir().join(format!("ec-launch-guard-2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let _first = Launch::begin(Some(&dir), false, false);
-        assert_eq!(Launch::begin(Some(&dir), false, false).backends, None);
+        let _first = Launch::begin(Some(&dir), false, false, false);
+        assert_eq!(Launch::begin(Some(&dir), false, false, false).backends, None);
         assert_eq!(window_graphics(&dir), "auto");
         drop(_first);
         if cfg!(not(target_os = "macos")) {
-            assert_eq!(Launch::begin(Some(&dir), false, false).backends, Some(Backends::GL), "a real crash still switches");
+            assert_eq!(Launch::begin(Some(&dir), false, false, false).backends, Some(Backends::GL), "a real crash still switches");
             opengl_failed(Some(&dir));
             assert_eq!(window_graphics(&dir), "auto");
-            assert_eq!(Launch::begin(Some(&dir), false, false).backends, None);
+            assert_eq!(Launch::begin(Some(&dir), false, false, false).backends, None);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
