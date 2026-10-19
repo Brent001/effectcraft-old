@@ -170,16 +170,22 @@ fn main() -> eframe::Result {
     // Wayland shows the window's icon from its desktop entry: an AppImage brings its own.
     #[cfg(target_os = "linux")]
     appimage::integrate_from_env(ICON_PNG);
-    // Settings ▸ Startup & Repair ▸ Window Graphics: prefer DX12 on affected Intel hardware,
-    // and retry DX12 before the OpenGL compatibility fallback after a failed launch (#243).
+    // Intel HD 520 reports have shown DX12 opening only a background process. Prefer Vulkan on
+    // this exact adapter when its driver exposes it; keep guarded DX12 preference for other Intel
+    // adapters. An explicit WGPU_BACKEND always remains authoritative.
     #[cfg(target_os = "windows")]
-    let prefer_dx12 = use_dx12_for_affected_intel();
+    let prefer_vulkan = use_vulkan_for_hd520();
+    #[cfg(not(target_os = "windows"))]
+    let prefer_vulkan = false;
+    #[cfg(target_os = "windows")]
+    let prefer_dx12 = !prefer_vulkan && use_dx12_for_affected_intel();
     #[cfg(not(target_os = "windows"))]
     let prefer_dx12 = false;
     let mut launch = launch_guard::Launch::begin(
         effectcraft_host::config_dir().as_deref(),
         std::env::var_os("WGPU_BACKEND").is_some(),
         prefer_dx12,
+        prefer_vulkan,
     );
     let on_gl = launch.backends == Some(eframe::wgpu::Backends::GL);
     let notice = launch.notice.take();
@@ -195,7 +201,7 @@ fn main() -> eframe::Result {
             // Wayland matches the window to `ai.storyteller.effectcraft.desktop` by this ID.
             .with_app_id(appimage::APP_ID),
         event_loop_builder: agent_event_loop(control_port.is_some()),
-        wgpu_options: wgpu_options(launch.backends, prefer_dx12),
+        wgpu_options: wgpu_options(launch.backends, prefer_dx12, prefer_vulkan),
         ..Default::default()
     };
     // Start-up milestones go to stderr and the session log, so a window that never appears
@@ -375,9 +381,31 @@ fn intel_gen9_to_gen11(device: u32) -> bool {
         || device == 0x0a84
 }
 
+/// Probe Vulkan for the Intel HD Graphics 520. If the driver exposes Vulkan, Automatic mode
+/// prefers it to avoid the DX12 startup hang reported for this adapter.
+#[cfg(target_os = "windows")]
+fn use_vulkan_for_hd520() -> bool {
+    if std::env::var_os("WGPU_BACKEND").is_some() {
+        return false;
+    }
+    let mut descriptor = eframe::wgpu::InstanceDescriptor::new_without_display_handle();
+    descriptor.backends = eframe::wgpu::Backends::VULKAN;
+    let instance = eframe::wgpu::Instance::new(descriptor);
+    let adapters = pollster::block_on(instance.enumerate_adapters(eframe::wgpu::Backends::VULKAN));
+    let found = adapters.iter().any(|adapter| {
+        let info = adapter.get_info();
+        info.vendor == 0x8086
+            && info.device_type == eframe::wgpu::DeviceType::IntegratedGpu
+            && info.device == 0x1916
+    });
+    if found {
+        log::warn!("Intel HD Graphics 520 Vulkan adapter detected; preferring Vulkan over the DX12 startup path");
+    }
+    found
+}
+
 /// Probe DirectX 12 only, without initialising Vulkan. On affected Intel hardware this lets
-/// EffectCraft choose DX12 before the known Intel Vulkan driver can crash during adapter/device
-/// creation. An explicit WGPU_BACKEND remains authoritative.
+/// EffectCraft choose DX12 when no HD 520 Vulkan adapter is found. An explicit WGPU_BACKEND remains authoritative.
 #[cfg(target_os = "windows")]
 fn use_dx12_for_affected_intel() -> bool {
     if std::env::var_os("WGPU_BACKEND").is_some() {
@@ -399,9 +427,17 @@ fn use_dx12_for_affected_intel() -> bool {
     found
 }
 
-fn wgpu_options(backends: Option<eframe::wgpu::Backends>, prefer_dx12: bool) -> eframe::WgpuConfiguration {
+fn wgpu_options(backends: Option<eframe::wgpu::Backends>, prefer_dx12: bool, prefer_vulkan: bool) -> eframe::WgpuConfiguration {
     use eframe::egui_wgpu::WgpuSetup;
-    let effective_backends = backends.or_else(|| prefer_dx12.then_some(eframe::wgpu::Backends::DX12));
+    let effective_backends = backends.or_else(|| {
+        if prefer_vulkan {
+            Some(eframe::wgpu::Backends::VULKAN)
+        } else if prefer_dx12 {
+            Some(eframe::wgpu::Backends::DX12)
+        } else {
+            None
+        }
+    });
     let mut config = eframe::WgpuConfiguration::default();
     if let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
         if let Some(b) = effective_backends {
