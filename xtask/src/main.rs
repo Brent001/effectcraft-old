@@ -37,6 +37,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("path", 1),
     ("psd", 1),
     ("aep", 1),
+    ("aep-import", 3),
     ("segment", 1),
     ("project", 2),
     ("text", 2),
