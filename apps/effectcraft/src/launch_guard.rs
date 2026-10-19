@@ -77,10 +77,9 @@ impl Launch {
             && cfg!(not(target_os = "macos"))
             && matches!(prefs.startup.window_graphics.as_str(), "auto" | "dx12" | "vulkan")
         {
-            // On affected Intel GPUs, Automatic first tries DX12. If that fails, try Vulkan
-            // once before OpenGL; if Vulkan also fails, keep OpenGL until the user changes the
-            // setting. This gives HD 520-class adapters another compute-capable path without
-            // allowing a repeating driver-crash loop.
+            // On affected Intel GPUs, Automatic retries DX12 once. If the chosen backend
+            // still fails, recover to OpenGL rather than automatically loading another graphics
+            // driver that may crash before the window appears. Vulkan is opt-in in Window Graphics.
             let previous = prefs.startup.window_graphics.clone();
             let next = if prefs.startup.window_graphics == "auto" && cfg!(target_os = "windows") && prefer_dx12 {
                 // On affected Intel GPUs, retry DX12 once before disabling GPU compositing.
