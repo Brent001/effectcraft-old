@@ -1285,6 +1285,8 @@ name = "effectcraft-engine"
 version = "0.12.0"
 dependencies = [
  "craft-docpath",
+ "effectcraft-aep-export",
+ "effectcraft-aep-import",
  "effectcraft-color",
  "effectcraft-effects",
  "effectcraft-geom",
