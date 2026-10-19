@@ -131,7 +131,7 @@ page!(Startup {
     offer_crash_recovery: bool = true,
     /// What the desktop window draws with, from the next launch: `auto` (the platform's best
     /// graphics API), `dx12`, `vulkan` or `gl` (OpenGL, for drivers that crash with the others).
-    /// On Intel HD Graphics 520 with a Vulkan adapter, Automatic prefers Vulkan and redirects saved DX12 selections; failed Vulkan starts fall back to OpenGL. Other affected Intel adapters try Vulkan after a DX12 startup failure.
+    /// On affected Intel Windows GPUs, Automatic prefers DX12 without probing Vulkan before window creation; Vulkan is an experimental manual choice. Failed graphics startups recover to OpenGL rather than repeatedly loading another potentially faulty driver.
     window_graphics: String = "auto".into(),
 });
 
