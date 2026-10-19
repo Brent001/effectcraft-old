@@ -367,8 +367,8 @@ fn main() -> eframe::Result {
 /// instead of eframe's fixed set: an older GPU that can't meet those (Intel HD Graphics 5500,
 /// #198) still opens the app, and the compositor then checks what it needs and falls back to
 /// the CPU when the device can't run it. `backends`: Window Graphics' choice, when it makes one.
-/// Intel Gen 9–11 integrated GPU device IDs whose Vulkan drivers are known to be fragile
-/// in this compositor. Device IDs are PCI IDs (the Intel HD Graphics 520 is 0x1916).
+/// Intel Gen 9–11 integrated GPU device IDs whose drivers need a guarded backend fallback.
+/// Device IDs are PCI IDs (the Intel HD Graphics 520 is 0x1916).
 #[cfg(target_os = "windows")]
 fn intel_gen9_to_gen11(device: u32) -> bool {
     matches!(device >> 8, 0x19 | 0x1a | 0x31 | 0x3e | 0x45 | 0x4e | 0x59 | 0x5a | 0x87 | 0x8a | 0x9b)
