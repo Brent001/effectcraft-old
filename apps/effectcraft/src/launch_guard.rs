@@ -352,10 +352,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// On affected Intel Windows hardware a failed Automatic launch retries DX12, then OpenGL.
+    /// On affected Intel Windows hardware, a failed Automatic launch retries DX12, then Vulkan, then OpenGL.
     #[cfg(target_os = "windows")]
     #[test]
-    fn affected_intel_retries_dx12_before_opengl() {
+    fn affected_intel_retries_dx12_then_vulkan_before_opengl() {
         let dir = std::env::temp_dir().join(format!("ec-launch-guard-dx12-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // First attempt was Automatic and crashed before drawing.
@@ -364,11 +364,19 @@ mod tests {
         assert_eq!(dx12.backends, Some(Backends::DX12));
         assert!(dx12.notice.as_deref().is_some_and(|n| n.contains("DirectX 12")));
         assert_eq!(window_graphics(&dir), "dx12");
-        // DX12 also failed: next attempt uses OpenGL to avoid repeating the crash.
+
+        // DX12 also failed: try Vulkan instead of immediately disabling the compositor.
         drop(dx12);
+        let vulkan = Launch::begin(Some(&dir), false, true);
+        assert_eq!(vulkan.backends, Some(Backends::VULKAN));
+        assert_eq!(window_graphics(&dir), "vulkan");
+
+        // Vulkan failed too: recover to OpenGL rather than repeating driver startup crashes.
+        drop(vulkan);
         let gl = Launch::begin(Some(&dir), false, true);
         assert_eq!(gl.backends, Some(Backends::GL));
         assert_eq!(window_graphics(&dir), "gl");
+        assert!(dir.join(DX12_FALLBACK_BLOCKED).exists());
         drop(gl);
         let _ = std::fs::remove_dir_all(&dir);
     }
