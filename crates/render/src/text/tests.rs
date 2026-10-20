@@ -99,6 +99,24 @@ fn range_based_on_words_and_lines() {
     assert_eq!(s, vec![0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0], "{s:?}");
 }
 
+/// With Units = Index a Range Selector's Start, End and Offset are character counts, not
+/// percentages (#1814); the selector's other values, and other selectors, are unaffected.
+#[test]
+fn index_units_mark_start_end_and_offset() {
+    let (mut p, _cid, comp) = setup(400, 200);
+    let mut l = text_layer(&mut p, &comp, doc("ABCDEFG", 30.0));
+    animator(&mut p, &mut l, &["opacity"], &["range", "wiggly"]);
+    let uid = |l: &Layer, path: &str| l.props.prop(path).unwrap_or_else(|| panic!("no {path}")).uid;
+    let base = "text/animators/#1/selectors/#1";
+    let range_values = ["start", "end", "offset"].map(|k| uid(&l, &format!("{base}/{k}")));
+    assert!(range_values.iter().all(|u| !in_index_units(&l, *u)), "Percentage, the default");
+    set(&mut l, &format!("{base}/advanced/units"), Value::Enum(1));
+    assert!(range_values.iter().all(|u| in_index_units(&l, *u)));
+    assert!(!in_index_units(&l, uid(&l, &format!("{base}/advanced/amount"))), "Amount stays a percentage");
+    assert!(!in_index_units(&l, uid(&l, "text/animators/#1/properties/opacity")));
+    assert!(!in_index_units(&l, uid(&l, "transform/opacity")));
+}
+
 #[test]
 fn range_start_end_and_offset_are_capped() {
     let (mut p, cid, comp) = setup(400, 200);
