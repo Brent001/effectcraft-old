@@ -188,6 +188,14 @@ pub fn range_value_of(f: f64, offset: f64, units_index: bool, n: usize) -> f64 {
     if units_index { (v * n as f64).round() } else { v * 100.0 }
 }
 
+/// Whether property `uid` of `layer` is a Range Selector's Start, End or Offset while its Units
+/// are Index: the value is then a count of characters (words, lines), not a percentage.
+pub fn in_index_units(layer: &Layer, uid: effectcraft_project::Uid) -> bool {
+    let Some(sel) = layer.props.parent_of(uid).filter(|g| g.match_id == "rangeSelector") else { return false };
+    let is_range_value = sel.props().any(|p| p.uid == uid && matches!(p.match_id.as_str(), "start" | "end" | "offset"));
+    is_range_value && sel.prop("advanced/units").is_some_and(|u| u.value == Value::Enum(1))
+}
+
 /// Selection of every glyph by an animator's selectors, per dimension.
 pub fn animator_selection(ctx: &EvalCtx, layer: &Layer, anim: &PropGroup, lay: &TextLayout) -> Vec<[f64; 3]> {
     let sels: Vec<&PropGroup> = anim.sub("selectors").map(|s| s.groups().filter(|g| g.enabled).collect()).unwrap_or_default();

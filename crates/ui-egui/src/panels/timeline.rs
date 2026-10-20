@@ -4121,7 +4121,9 @@ fn value_editor(
                     set(actions, json!(nv));
                 }
             } else {
-                let suffix = if matches!(prop.ui, ParamUi::Percent) || prop.match_id == "opacity" { "%" } else { "" };
+                // A Range Selector's Start, End and Offset count characters with Units = Index (#1814).
+                let pct = (matches!(prop.ui, ParamUi::Percent) || prop.match_id == "opacity") && !effectcraft_engine::render::text::in_index_units(layer, uid);
+                let suffix = if pct { "%" } else { "" };
                 let (r, nv, _) = widgets::hot_number_at(ui, pos2(x, y), egui::Id::new(("v", uid, 0)), *v, speed, (min, max), dec.max(1), suffix, &t);
                 app.auto.add(&format!("timeline.prop.{uid}.value"), r, &prop.name);
                 if let Some(nv) = nv {
