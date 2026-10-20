@@ -142,6 +142,10 @@ impl Drop for Lease {
             && let Ok(mut p) = pool.lock()
         {
             if self.escaped.load(Relaxed) {
+                #[cfg(test)]
+                if !p.open.is_empty() {
+                    p.escaped_parked += 1;
+                }
                 p.release(self.texture.clone());
             } else {
                 p.release_owned(self.texture.clone(), self.owner);
