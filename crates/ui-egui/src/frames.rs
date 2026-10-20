@@ -41,6 +41,8 @@ const MAX_KEEPERS: usize = 64;
 /// video memory there is: each time the device runs out, the budget halves (to
 /// [`MIN_GPU_BUDGET`]) and the frame renders on the CPU (#106).
 const GPU_BUDGET: usize = 1 << 30;
+/// Integrated GPUs share system RAM with the app and often have a much smaller practical budget.
+const INTEGRATED_GPU_BUDGET: usize = 128 << 20;
 const MIN_GPU_BUDGET: usize = 64 << 20;
 
 /// A rendered viewer frame: CPU pixels or a GPU texture.
@@ -444,6 +446,9 @@ pub struct Frames {
     #[cfg(not(target_arch = "wasm32"))]
     content_key_jobs: Arc<Mutex<ContentKeyJobs>>,
     gpu_retired: Arc<AtomicBool>,
+    /// Low-memory adapters should not receive overlapping preview-frame GPU workloads.
+    gpu_render_lock: Arc<Mutex<()>>,
+    serialize_gpu: Arc<AtomicBool>,
     /// [`comp_content`] identities by (revision, comp), with the project that keeps an identity
     /// found by [`Frames::identity`] in another project.
     identities: Mutex<HashMap<(u64, u64), Identity>>,
@@ -480,6 +485,8 @@ impl Default for Frames {
             #[cfg(not(target_arch = "wasm32"))]
             content_key_jobs: Arc::default(),
             gpu_retired: Arc::default(),
+            gpu_render_lock: Arc::default(),
+            serialize_gpu: Arc::new(AtomicBool::new(false)),
             identities: Mutex::default(),
             bases: Mutex::default(),
             keepers: Mutex::default(),
@@ -620,6 +627,17 @@ impl Frames {
     pub fn set_context(&mut self, ctx: &egui::Context) {
         if self.ctx.is_none() {
             self.ctx = Some(ctx.clone());
+        }
+    }
+
+    /// Configure preview memory use for integrated or software adapters. GPU display frames are
+    /// cached separately from working textures; keep fewer on shared-memory devices and serialize
+    /// their preview renders to avoid bursts of allocations and submissions.
+    pub fn configure_gpu_profile(&self, constrained: bool) {
+        self.serialize_gpu.store(constrained, Ordering::Release);
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.gpu_budget = if constrained { INTEGRATED_GPU_BUDGET } else { GPU_BUDGET };
+            cache.evict_gpu();
         }
     }
 
@@ -965,6 +983,8 @@ impl Frames {
             last: self.last_ms.clone(),
             content_keys: self.content_keys.clone(),
             gpu_retired: self.gpu_retired.clone(),
+            gpu_render_lock: self.gpu_render_lock.clone(),
+            serialize_gpu: self.serialize_gpu.clone(),
         }
     }
 
@@ -1094,6 +1114,8 @@ struct Worker {
     last: Arc<Mutex<f64>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
+    gpu_render_lock: Arc<Mutex<()>>,
+    serialize_gpu: Arc<AtomicBool>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1214,7 +1236,15 @@ impl Worker {
     /// [`Worker::render_job`], again on the CPU if it panicked (the panic hook has logged it);
     /// `None` if that panicked too.
     fn render_guarded(&self, job: &Job) -> Option<FrameImage> {
-        let attempt = |gpu: bool| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.render_job(job, gpu))).ok();
+        let attempt = |gpu: bool| {
+            let render = || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.render_job(job, gpu))).ok();
+            if gpu && job.src.gpu.is_some() && self.serialize_gpu.load(Ordering::Acquire) {
+                let _slot = self.gpu_render_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                render()
+            } else {
+                render()
+            }
+        };
         attempt(true).or_else(|| {
             log::error!("a frame render panicked (frame {})", job.key.frame);
             job.src.gpu.as_ref().and_then(|_| attempt(false))
@@ -1744,6 +1774,17 @@ mod tests {
             c.gpu_out_of_memory();
         }
         assert_eq!(c.gpu_budget, MIN_GPU_BUDGET);
+    }
+
+    #[test]
+    fn integrated_gpu_profile_limits_cached_display_textures_and_serializes_gpu_jobs() {
+        let f = Frames::default();
+        f.configure_gpu_profile(true);
+        assert!(f.serialize_gpu.load(Ordering::Acquire));
+        assert_eq!(f.cache.lock().unwrap().gpu_budget, INTEGRATED_GPU_BUDGET);
+        f.configure_gpu_profile(false);
+        assert!(!f.serialize_gpu.load(Ordering::Acquire));
+        assert_eq!(f.cache.lock().unwrap().gpu_budget, GPU_BUDGET);
     }
 
     #[test]
