@@ -1377,8 +1377,11 @@ impl<'g> Enc<'g> {
         ext: Option<[&wgpu::Buffer; 4]>,
     ) {
         let g = self.g;
-        let Some(pipe) = if ext.is_some() { g.ext_pipeline(entry) } else { g.pipeline(entry) } else {
+        let core_kernel = g.pipelines.contains_key(entry) || g.ext_pipelines.contains_key(entry);
+        let pipeline = if ext.is_some() { g.ext_pipeline(entry) } else { g.pipeline(entry) };
+        let Some(pipe) = pipeline else {
             self.missing = true;
+            self.core_missing |= core_kernel;
             return;
         };
         let ub = g.buffer_init(None, &p.bytes(), wgpu::BufferUsages::UNIFORM);
