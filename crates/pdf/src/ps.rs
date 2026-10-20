@@ -467,6 +467,10 @@ impl Interp {
         if let Some(v) = self.lookup(n) {
             return match v {
                 V::Proc(_) => self.exec_obj(v, src),
+                // An operator stored under another name (`/mo /moveto load def`, as Illustrator's
+                // EPS prolog does for every path operator) runs that operator. It pushed the
+                // operator's name instead, so such files drew nothing (#955).
+                V::Name(op) => self.builtin(&op, src),
                 other => {
                     self.push(other);
                     Ok(())
@@ -1203,6 +1207,96 @@ impl Interp {
                 }
             }
             "currentglobal" | "currentpacking" | "currentshared" => self.push(V::Bool(false)),
+            // Operators that return values must push them, or the rest of the program reads a
+            // shifted stack: Illustrator's EPS prolog queries the device this way and then drew
+            // nothing (#955). Values are a plain device's defaults (PostScript Language
+            // Reference, 3rd ed., chapter 8).
+            "currentflat" => self.push(V::Num(1.0)),
+            "currentscreen" => {
+                self.push(V::Num(60.0));
+                self.push(V::Num(45.0));
+                self.push(V::Proc(Rc::new(vec![])));
+            }
+            "currentblackgeneration" | "currentundercolorremoval" | "currenttransfer" => self.push(V::Proc(Rc::new(vec![]))),
+            "currentcolortransfer" => {
+                for _ in 0..4 {
+                    self.push(V::Proc(Rc::new(vec![])));
+                }
+            }
+            "currentpagedevice" | "currenthalftone" | "currentsystemparams" | "currentuserparams" | "currentdevparams" => {
+                if n == "currentdevparams" {
+                    self.pop();
+                }
+                self.push(V::Dict(new_dict()));
+            }
+            "setuserparams" | "setsystemparams" | "setcolortransfer" | "setblackgeneration" | "setundercolorremoval" => {
+                let k = if n == "setcolortransfer" { 4 } else { 1 };
+                for _ in 0..k {
+                    self.pop();
+                }
+            }
+            // `file status` → false; `string status` → false (no such file).
+            "status" => {
+                self.pop();
+                self.push(V::Bool(false));
+            }
+            "dictstack" => {
+                self.pop();
+                let ds: Vec<V> = self.dicts.iter().map(|d| V::Dict(d.clone())).collect();
+                self.push(array(ds));
+            }
+            "maxlength" => {
+                let k = match self.pop() {
+                    V::Dict(d) => d.borrow().len(),
+                    _ => 0,
+                };
+                self.push(V::Num(k.saturating_add(16) as f64));
+            }
+            "internaldict" => {
+                self.pop();
+                let d = self.dicts[0].clone();
+                self.push(V::Dict(d));
+            }
+            "undefineresource" => {
+                self.pop();
+                self.pop();
+            }
+            // `[ … /Name pdfmark`: a Distiller annotation; other interpreters discard it.
+            "pdfmark" => {
+                while let Some(v) = self.st.pop() {
+                    if matches!(v, V::Mark) {
+                        break;
+                    }
+                }
+            }
+            // `source [params] /Name filter`. A SubFileDecode of the current file with a count of
+            // 0 reads to its end-of-data string: skip that data (an embedded XMP packet, which
+            // otherwise ran as PostScript). Other filters stand for the file they read.
+            "filter" => {
+                let name = self.pop().key();
+                if name == "SubFileDecode" {
+                    let eod = match self.pop() {
+                        V::Str(s) => s.borrow().clone(),
+                        _ => vec![],
+                    };
+                    let count = self.popn();
+                    if let V::File = self.pop()
+                        && count == 0.0
+                        && !eod.is_empty()
+                    {
+                        src.pos = match find_from(src.d, &eod, src.pos) {
+                            Some(p) => p.saturating_add(eod.len()),
+                            None => src.d.len(),
+                        };
+                    }
+                } else {
+                    if matches!(self.st.last(), Some(V::Dict(_))) {
+                        self.pop();
+                    }
+                    self.pop();
+                }
+                self.push(V::File);
+            }
             "vmstatus" => {
                 for _ in 0..3 {
                     self.push(V::Num(0.0));
@@ -1236,8 +1330,14 @@ impl Interp {
                 let a: Vec<f64> = self.pop().items().unwrap_or_default().iter().filter_map(V::num).collect();
                 self.gs.dash = (!a.is_empty() && a.iter().any(|v| *v > 0.0)).then_some((a, off));
             }
-            "setflat" | "setstrokeadjust" | "setoverprint" | "setrenderingintent" | "setcolorrendering" | "sethalftone" | "setscreen" | "settransfer" => {
+            "setflat" | "setstrokeadjust" | "setoverprint" | "setrenderingintent" | "setcolorrendering" | "sethalftone" | "settransfer" => {
                 self.pop();
+            }
+            // frequency angle proc
+            "setscreen" => {
+                for _ in 0..3 {
+                    self.pop();
+                }
             }
             "setgray" => {
                 let g = self.popn().clamp(0.0, 1.0);

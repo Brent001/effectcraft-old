@@ -25,6 +25,26 @@ fn ink_x(img: &effectcraft_raster::Image) -> (i64, i64) {
     (x0, x1)
 }
 
+/// #955: EPS files that name their operators (`/mo /moveto load def`, as Illustrator's do),
+/// query the device and embed metadata read through a SubFileDecode filter draw their artwork.
+/// They imported as an empty layer.
+#[test]
+fn eps_with_aliased_operators_device_queries_and_embedded_data_draws() {
+    let square = "1 0 0 setrgbcolor 50 25 mo 150 25 li 150 75 li 50 75 li cp f\n";
+    let aliases = "/mo /moveto load def /li /lineto load def /cp /closepath load def /f /fill load def\n";
+    let doc = eps(format!("{aliases}{square}").as_bytes());
+    assert!(coverage(&render(&doc), 50, 25, 150, 75) > 4900.0, "aliased operators draw the square");
+    // Every operator that returns a value pushes it, so the stack stays aligned.
+    let queries = "mark currentflat currentscreen currentpagedevice currenthalftone currentblackgeneration \
+                   currentundercolorremoval currentcolortransfer currentsystemparams counttomark 13 eq /ok exch def cleartomark\n";
+    let doc = eps(format!("{aliases}{queries}ok {{ {square} }} if\n").as_bytes());
+    assert!(coverage(&render(&doc), 50, 25, 150, 75) > 4900.0, "device queries leave 13 values");
+    // Data up to the end-of-data string isn't run: its unbalanced brace would swallow the rest.
+    let data = "currentfile 0 (%END-OF-DATA) /SubFileDecode filter pop\n<x> { ( not PostScript\n%END-OF-DATA\n";
+    let doc = eps(format!("{aliases}{data}{square}").as_bytes());
+    assert!(coverage(&render(&doc), 50, 25, 150, 75) > 4900.0, "drawing after the embedded data");
+}
+
 #[test]
 fn eps_text_with_bundled_fonts_and_show_variants() {
     // Not embedded: drawn with the bundled stand-in, like the same text in a PDF.
