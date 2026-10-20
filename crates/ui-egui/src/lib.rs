@@ -801,6 +801,13 @@ impl EffectcraftApp {
         let Some(rs) = frame.wgpu_render_state() else { return };
         // Help ▸ System Compatibility Report names the adapter and backend the window got.
         let info = rs.adapter.get_info();
+        let adapter_name = info.name.to_ascii_lowercase();
+        let constrained_gpu = matches!(
+            info.device_type,
+            effectcraft_gpu::wgpu::DeviceType::IntegratedGpu | effectcraft_gpu::wgpu::DeviceType::Cpu
+        ) || (adapter_name.contains("intel")
+            && (adapter_name.contains("hd graphics") || adapter_name.contains("uhd graphics") || adapter_name.contains("iris")));
+        self.frames.configure_gpu_profile(constrained_gpu);
         self.session.window_adapter = Some(format!(
             "{} ({:?}, {:?}{})",
             info.name,

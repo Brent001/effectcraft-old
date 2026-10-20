@@ -948,7 +948,7 @@ fn shader_constants_match_the_cpu() {
     let [r, g, b] = BW_TINT_LUMA;
     assert!(color.contains(&format!("let w = vec3<f32>({r}, {g}, {b});")), "fxc_bw_tint weights are not {BW_TINT_LUMA:?}");
     let gamma = EXPOSURE_LINEAR_GAMMA;
-    assert!(kernels.contains(&format!("powz(abs(c[i]), {gamma})")) && kernels.contains(&format!("1.0 / {gamma})"), "Exposure's power in kernels.wgsl is not {gamma}");
+    assert!(kernels.contains(&format!("powz(abs(c[i]), {gamma})")) && kernels.contains(&format!("1.0 / {gamma})")), "Exposure's power in kernels.wgsl is not {gamma}");
 }
 
 /// WGSL cannot read the CPU's constants, so Glow's bright pass repeats them as literals; this
