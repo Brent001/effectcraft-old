@@ -866,7 +866,30 @@ fn effect_kernels_build_on_first_use() {
     ctx.build_all_kernels();
     eprintln!("{}: built {} effect kernels in {:.2?}", ctx.name, built(&ctx), started.elapsed());
     assert_eq!(ctx.unavailable_kernels(), vec![], "every effect kernel builds on {}", ctx.name);
+} 
+
+/// Core compositor and sky pipelines are also lazy, so constructing the context does not
+/// synchronously compile kernels that the current project may never use.
+#[test]
+fn compositor_kernels_build_on_first_use() {
+    if gpu().is_none() {
+        return;
+    }
+    let Ok(ctx) = pollster::block_on(crate::context::GpuContext::request()) else { return };
+    assert_eq!(ctx.core_pipelines_built(), 0, "core pipelines must not compile during context setup");
+    let g = Gpu::from_context(ctx);
+    let mut scene = Scene::new(BitDepth::Bpc8);
+    let layer = scene.solid([0.25, 0.5, 0.75], 32, 24);
+    scene.push(layer);
+    let mut renderer = Renderer::new(&scene.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+    renderer.accel = Some(&g);
+    let image = g.render(&renderer, scene.cid, Tick::ZERO).expect("the simple comp should render on GPU");
+    assert_eq!(image.width, 32);
+    assert_eq!(image.height, 24);
+    assert!(g.context().core_pipelines_built() > 0, "compositing should build only the required core kernels");
+    check("lazy core compositor vs CPU", compare_at(&scene, opts(), Tick::ZERO), 0.0);
 }
+
 
 
 /// The GPU Tint gives After Effects 2026's greys for full-frame solids at its defaults (sRGB
