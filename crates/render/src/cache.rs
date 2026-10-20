@@ -22,7 +22,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use effectcraft_effects::Buf;
-use effectcraft_project::{ItemKind, Layer, LayerSource, Node, PropGroup};
+use effectcraft_project::{FootageKind, ItemKind, Layer, LayerSource, Node, PropGroup};
 
 use crate::eval::EvalCtx;
 
@@ -481,7 +481,7 @@ fn hash_values(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, g: &PropGroup) {
 }
 
 /// Cache key for the processed (source → masks → effects) buffer of `layer` at the context
-/// time, or `None` when the layer must not be cached (footage, precomps, cameras, adjustment
+/// time, or `None` when the layer must not be cached (movie footage, precomps, cameras, adjustment
 /// layers…).
 pub fn layer_key(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool) -> Option<u64> {
     // Time effects see property values at other times. Keyframes are part of the hashed
@@ -511,6 +511,34 @@ fn reads_other_times(layer: &Layer) -> bool {
     layer.switches.effects
         && layer.effects().is_some_and(|fx| {
             fx.groups().any(|g| g.enabled && matches!(&g.kind, effectcraft_project::GroupKind::Effect { effect } if effect.starts_with("ec.time.")))
+        })
+}
+
+/// A still image (no proxy): its layer is cached like a text or shape layer, so the GPU
+/// compositor uploads it once, not every frame (#1812: four 21120 px plates re-uploaded by every
+/// preview worker ran the GPU out of memory). Movies and sequences stay in the media pool only.
+fn still_footage(ctx: &EvalCtx, item: effectcraft_project::ItemId) -> bool {
+    ctx.project.item(item).is_some_and(|it| it.proxy.is_none() && matches!(&it.kind, ItemKind::Footage(f) if f.kind == FootageKind::Still))
+}
+
+/// Does the layer have an animated mask that motion blur may draw at other times (Layer ▸ Mask ▸
+/// Motion Blur On, or Same As Layer with the layer blurred)?
+fn mask_motion_blur(ctx: &EvalCtx, layer: &Layer, blur: bool) -> bool {
+    use effectcraft_project::{GroupKind, MaskMotionBlur};
+    fn animated(g: &PropGroup) -> bool {
+        g.children.iter().any(|c| match c {
+            Node::Prop(p) => !p.keys.is_empty() || p.has_expression(),
+            Node::Group(sub) => animated(sub),
+        })
+    }
+    ctx.comp.enable_motion_blur
+        && layer.masks().is_some_and(|m| {
+            m.groups().any(|g| match g.kind {
+                GroupKind::Mask { motion_blur, .. } => {
+                    (motion_blur == MaskMotionBlur::On || (motion_blur == MaskMotionBlur::SameAsLayer && blur)) && animated(g)
+                }
+                _ => false,
+            })
         })
 }
 
@@ -552,14 +580,17 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
             hash_debug(&mut h, s);
         }
         LayerSource::Text | LayerSource::Shape => {}
-        LayerSource::Footage { item } if footage => {
+        LayerSource::Footage { item } if footage || still_footage(ctx, *item) => {
             let it = ctx.project.item(*item)?;
             let ItemKind::Footage(f) = &it.kind else { return None };
             hash_debug(&mut h, f);
             // A proxy (and its Use Proxy switch) changes the pixels.
             hash_debug(&mut h, &it.proxy);
             item.hash(&mut h);
-            ctx.source_time(layer).0.hash(&mut h);
+            // A still is the same at every time (unless a proxy, which may be a movie, stands in).
+            if f.kind != FootageKind::Still || it.proxy.is_some() {
+                ctx.source_time(layer).0.hash(&mut h);
+            }
             // Frame blending mixes neighbouring source frames.
             ctx.comp.enable_frame_blending.hash(&mut h);
         }
@@ -624,6 +655,11 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
         for g in fx.groups().filter(|g| g.enabled && effectcraft_effects::paint::is_paint(g)) {
             effectcraft_effects::paint::cache_key(g, lt).0.hash(&mut h);
         }
+    }
+    // Mask motion blur draws animated masks at the shutter's other times too: their values at
+    // this time don't tell two frames apart (a hold before a move).
+    if mask_motion_blur(ctx, layer, blur) {
+        layer.layer_time(ctx.time).0.hash(&mut h);
     }
     if time_dependent(layer, effects != Some(0)) {
         layer.layer_time(ctx.time).0.hash(&mut h);
