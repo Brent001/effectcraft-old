@@ -38,6 +38,10 @@ jobs:
         shell: pwsh
         run: cargo generate-lockfile
 
+      - name: Verify Windows release dependencies with locked lockfile
+        shell: pwsh
+        run: cargo build --release --locked -p effectcraft -p effectcraft-cli --target x86_64-pc-windows-msvc
+
       - name: Create repair branch and commit lockfile
         id: commit
         shell: pwsh
@@ -59,14 +63,10 @@ jobs:
             git commit -m "ci: refresh Cargo.lock"
             if ($LASTEXITCODE -ne 0) { throw "Could not commit regenerated Cargo.lock" }
             git push origin "HEAD:refs/heads/$branch"
-            if ($LASTEXITCODE -ne 0) { throw "Could not push repair branch" }
+            if ($LASTEXITCODE -ne 0) { throw "Could not push repair branch. Check Actions workflow permissions and branch rules." }
             "changed=true" >> $env:GITHUB_OUTPUT
             "branch=$branch" >> $env:GITHUB_OUTPUT
           }
-
-      - name: Verify Windows release dependencies with locked lockfile
-        shell: pwsh
-        run: cargo build --release --locked -p effectcraft -p effectcraft-cli --target x86_64-pc-windows-msvc
 
       - name: Report repair branch
         if: always()
@@ -77,4 +77,4 @@ jobs:
         run: |
           "Repair branch: $env:BRANCH" >> $env:GITHUB_STEP_SUMMARY
           "Cargo.lock changed: $env:CHANGED" >> $env:GITHUB_STEP_SUMMARY
-          "Review and merge the repair branch only if the Windows build succeeds."
+          "The lockfile is pushed to a separate branch only after the Windows locked build succeeds. Review and merge that branch."
