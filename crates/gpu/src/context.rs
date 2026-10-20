@@ -1,6 +1,7 @@
 //! Device, pipelines, textures, uploads and readback.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, Weak};
 
 use effectcraft_effects::Buf;
@@ -124,6 +125,9 @@ struct Lease {
     pool: Weak<Mutex<Pool>>,
     /// The [`Enc`] that took it (see [`Pool::owned`]).
     owner: u64,
+    /// Handed to another encoder through the upload cache; it must return to the shared pool
+    /// because unrelated encoders may have recorded reads of it that are not submitted yet.
+    escaped: AtomicBool,
 }
 
 impl std::fmt::Debug for Lease {
@@ -137,7 +141,11 @@ impl Drop for Lease {
         if let Some(pool) = self.pool.upgrade()
             && let Ok(mut p) = pool.lock()
         {
-            p.release_owned(self.texture.clone(), self.owner);
+            if self.escaped.load(Relaxed) {
+                p.release(self.texture.clone());
+            } else {
+                p.release_owned(self.texture.clone(), self.owner);
+            }
         }
     }
 }
@@ -165,9 +173,11 @@ pub(crate) struct Pool {
     /// Its later commands run after everything it recorded or submitted before (one queue,
     /// recording order), so it can overwrite them at once instead of allocating a new texture
     /// for every intermediate of a frame (a 4K frame holds dozens). Other encoders never see a
-    /// working texture of another `Enc` before it is gone.
+    /// working texture of another `Enc` before it is gone, except handed-off chain results.
     owned: HashMap<u64, HashMap<(u32, u32), Vec<wgpu::Texture>>>,
     next_owner: u64,
+    #[cfg(test)]
+    escaped_parked: u64,
 }
 
 /// In-`Enc` texture reuse ([`Pool::owned`]); tests turn it off to compare.
@@ -444,6 +454,8 @@ pub struct GpuContext {
     dummy_tex: wgpu::TextureView,
     dummy_buf: wgpu::Buffer,
     uploads: Mutex<Uploads>,
+    /// Keep effect-chain results on the device for the compositor (tests may disable this).
+    pub(crate) handoff: AtomicBool,
     atlases: Mutex<Vec<Atlas>>,
     upload_budget: std::sync::atomic::AtomicUsize,
     upload_full_warned: std::sync::atomic::AtomicBool,
@@ -752,6 +764,7 @@ impl GpuContext {
             dummy,
             dummy_buf,
             uploads: Mutex::new(Uploads::default()),
+            handoff: AtomicBool::new(true),
             atlases: Mutex::default(),
             upload_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
             upload_full_warned: Default::default(),
@@ -1088,7 +1101,7 @@ impl GpuContext {
         let reused = self.pool.lock().ok().and_then(|mut p| p.take_owned(owner, w, h).or_else(|| p.take(w, h)));
         let was_reused = reused.is_some();
         let texture = reused.unwrap_or_else(|| self.texture(w, h));
-        let lease = Arc::new(Lease { texture: texture.clone(), pool: Arc::downgrade(&self.pool), owner });
+        let lease = Arc::new(Lease { texture: texture.clone(), pool: Arc::downgrade(&self.pool), owner, escaped: Default::default() });
         (GpuImage { texture, width: w, height: h, _lease: Some(lease), levels: None }, was_reused)
     }
 
@@ -1113,6 +1126,12 @@ impl GpuContext {
             readbacks: t.downs.load(Relaxed),
             readback_bytes: t.down_bytes.load(Relaxed),
         }
+    }
+
+    /// Handed-off textures released while encoders were still open (tests).
+    #[cfg(test)]
+    pub(crate) fn escaped_parked(&self) -> u64 {
+        self.pool.lock().map(|p| p.escaped_parked).unwrap_or(0)
     }
 
     /// Texture pool counters: (working textures reused, newly allocated).
@@ -1167,10 +1186,29 @@ impl GpuContext {
             }
         }
         let img = self.upload_image(&buf.img)?;
+        self.remember_upload(buf, img.clone());
+        Some(img)
+    }
+
+    /// Adopt a GPU image that already contains the pixels in `buf` (for example, the result
+    /// of a GPU effect chain read back into the CPU layer cache). Later uploads can reuse it.
+    pub(crate) fn adopt_upload(&self, buf: &Arc<Buf>, img: GpuImage) {
+        if (img.width, img.height) != (buf.img.width, buf.img.height) {
+            return;
+        }
+        if let Some(lease) = &img._lease {
+            // Other encoders may start reading this image. Do not return it to its original
+            // owner's private reusable textures when the last cache reference disappears.
+            lease.escaped.store(true, Relaxed);
+        }
+        self.remember_upload(buf, img);
+    }
+
+    fn remember_upload(&self, buf: &Arc<Buf>, img: GpuImage) {
+        let key = Arc::as_ptr(buf) as usize;
         if let Ok(mut u) = self.uploads.lock() {
             let bytes = buf.img.data.len() * 16;
-            // Another render worker may have advanced the clock while this upload was in flight.
-            // Allocate a unique, newest stamp when the entry is inserted.
+            // Another render worker may have advanced the clock while this image was in flight.
             u.clock += 1;
             let now = u.clock;
             if let Some(old) = u.map.remove(&key) {
@@ -1180,9 +1218,6 @@ impl GpuContext {
             u.map.insert(key, Upload { buf: Arc::downgrade(buf), img: img.clone(), bytes, last_use: now });
             u.order.insert((now, key));
             u.bytes += bytes;
-            // Drop textures of freed buffers at once (a layer whose buffer changes every frame
-            // makes a new one each time, and nothing can hit the old one again), then the least
-            // recently used over budget.
             let budget = self.upload_budget();
             let dead: Vec<usize> = u.map.iter().filter(|(_, e)| e.buf.strong_count() == 0).map(|(k, _)| *k).collect();
             for k in dead {
@@ -1206,7 +1241,7 @@ impl GpuContext {
                 }
             }
         }
-        Some(img)
+    }
     }
 
     /// The atlas kept for exactly these layer buffers (in this order), with their positions.
