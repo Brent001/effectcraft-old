@@ -399,6 +399,17 @@ struct Uploads {
     clock: u64,
 }
 
+/// Classic 3D plane atlases kept for the next frames (see [`GpuContext::cached_atlas`]).
+const ATLASES: usize = 2;
+
+/// A Classic 3D atlas of layer buffers, with each buffer's position in it.
+struct Atlas {
+    bufs: Vec<Weak<Buf>>,
+    img: GpuImage,
+    pos: Vec<(u32, u32)>,
+    last_use: u64,
+}
+
 /// The device and everything compiled for it.
 pub struct GpuContext {
     pub device: wgpu::Device,
@@ -412,7 +423,7 @@ pub struct GpuContext {
     layout: wgpu::PipelineLayout,
     /// The compositor's own kernels (built up front: the compositor can't run without them).
     pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
-    /// Core or Classic 3D kernels the driver could not build (these paths fall back to the CPU).
+    /// Core or Classic 3D kernels rejected by the driver; these paths fall back to the CPU.
     unavailable: Vec<(&'static str, String)>,
     /// Effect kernels with their family (index in `FAMILIES`), built on first dispatch; `Err`
     /// says why one didn't build (its effects render on the CPU).
@@ -425,6 +436,7 @@ pub struct GpuContext {
     dummy_tex: wgpu::TextureView,
     dummy_buf: wgpu::Buffer,
     uploads: Mutex<Uploads>,
+    atlases: Mutex<Vec<Atlas>>,
     upload_budget: std::sync::atomic::AtomicUsize,
     upload_full_warned: std::sync::atomic::AtomicBool,
     pool: Arc<Mutex<Pool>>,
@@ -737,6 +749,7 @@ impl GpuContext {
             dummy,
             dummy_buf,
             uploads: Mutex::new(Uploads::default()),
+            atlases: Mutex::default(),
             upload_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
             upload_full_warned: Default::default(),
             pool: Default::default(),
@@ -1073,6 +1086,12 @@ impl GpuContext {
         Some(g)
     }
 
+    /// Classic 3D atlases kept.
+    #[cfg(test)]
+    pub(crate) fn atlas_entries(&self) -> usize {
+        self.atlases.lock().map(|a| a.len()).unwrap_or_default()
+    }
+
     /// Entries in the layer upload cache.
     #[cfg(test)]
     pub(crate) fn upload_entries(&self) -> usize {
@@ -1140,6 +1159,39 @@ impl GpuContext {
         Some(img)
     }
 
+    /// The atlas kept for exactly these layer buffers (in this order), with their positions.
+    /// Atlases of freed buffers are dropped here so they do not retain video memory indefinitely.
+    pub(crate) fn cached_atlas(&self, bufs: &[Arc<Buf>]) -> Option<(GpuImage, Vec<(u32, u32)>)> {
+        let mut atlases = self.atlases.lock().ok()?;
+        atlases.retain(|atlas| atlas.bufs.iter().all(|weak| weak.strong_count() > 0));
+        let clock = atlases.iter().map(|atlas| atlas.last_use).max().unwrap_or(0) + 1;
+        let hit = atlases.iter_mut().find(|atlas| {
+            atlas.bufs.len() == bufs.len()
+                && atlas.bufs.iter().zip(bufs).all(|(weak, buf)| weak.upgrade().is_some_and(|held| Arc::ptr_eq(&held, buf)))
+        })?;
+        hit.last_use = clock;
+        Some((hit.img.clone(), hit.pos.clone()))
+    }
+
+    /// Keep an atlas for repeated Classic 3D frames built from the same layer buffers.
+    pub(crate) fn keep_atlas(&self, bufs: &[Arc<Buf>], img: GpuImage, pos: Vec<(u32, u32)>) {
+        if img.width as usize * img.height as usize * 16 > self.upload_budget() / 2 {
+            return;
+        }
+        let Ok(mut atlases) = self.atlases.lock() else { return };
+        atlases.retain(|atlas| atlas.bufs.iter().all(|weak| weak.strong_count() > 0));
+        if atlases.iter().any(|atlas| {
+            atlas.bufs.len() == bufs.len()
+                && atlas.bufs.iter().zip(bufs).all(|(weak, buf)| weak.upgrade().is_some_and(|held| Arc::ptr_eq(&held, buf)))
+        }) { return; }
+        let last_use = atlases.iter().map(|atlas| atlas.last_use).max().unwrap_or(0) + 1;
+        while atlases.len() >= ATLASES {
+            let Some(index) = atlases.iter().enumerate().min_by_key(|(_, atlas)| atlas.last_use).map(|(i, _)| i) else { break };
+            atlases.swap_remove(index);
+        }
+        atlases.push(Atlas { bufs: bufs.iter().map(Arc::downgrade).collect(), img, pos, last_use });
+    }
+
     /// Forget uploaded layer textures.
     pub fn clear_uploads(&self) {
         if let Ok(mut u) = self.uploads.lock() {
@@ -1147,6 +1199,7 @@ impl GpuContext {
             u.order.clear();
             u.bytes = 0;
         }
+        if let Ok(mut atlases) = self.atlases.lock() { atlases.clear(); }
         if let Ok(mut p) = self.pool.lock() {
             p.clear();
         }
