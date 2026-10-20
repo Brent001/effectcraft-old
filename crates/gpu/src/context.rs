@@ -1262,8 +1262,11 @@ pub(crate) struct Enc<'g> {
     /// The open command encoder and its id in the texture pool.
     enc: Option<(wgpu::CommandEncoder, u64)>,
     pending: usize,
-    /// A dispatch named a kernel the device doesn't have (see [`Enc::take_missing`]).
+    /// A missing effect kernel can be consumed to fall back for that effect only.
     missing: bool,
+    /// Core compositor / Classic 3D kernel failures must survive effect-local fallback checks so
+    /// the host can decline the entire frame rather than display partially composited pixels.
+    core_missing: bool,
     /// This `Enc`'s id in the texture pool (textures it may reuse at once).
     owner: u64,
 }
@@ -1283,13 +1286,19 @@ impl Drop for Enc<'_> {
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
         let owner = g.pool.lock().map(|mut p| p.register()).unwrap_or(0);
-        Enc { g, enc: None, pending: 0, missing: false, owner }
+        Enc { g, enc: None, pending: 0, missing: false, core_missing: false, owner }
     }
 
     /// Whether a dispatch since the last call named a kernel the device doesn't have (one
     /// that failed to build): its output is wrong, and the effect must render on the CPU.
     pub(crate) fn take_missing(&mut self) -> bool {
         std::mem::take(&mut self.missing)
+    }
+
+    /// Sticky for the lifetime of this frame: effect-local fallback must never consume a
+    /// compositor-kernel failure that would invalidate the full output.
+    pub(crate) fn take_core_missing(&mut self) -> bool {
+        std::mem::take(&mut self.core_missing)
     }
 
     pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
