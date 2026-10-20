@@ -1854,6 +1854,9 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
         ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if app.dialog == Some(crate::Dialog::LayerStyles) {
             crate::panels::layer_styles_dialog::finish(app, false);
+        } else if app.dialog == Some(crate::Dialog::GradientEditor) {
+            // Escape is Cancel: the preview rolls back.
+            crate::panels::gradient_editor::finish(app, false, ctx);
         } else if app.dialog == Some(crate::Dialog::Info) {
             crate::panels::forms::close_info(app);
         } else {
@@ -1866,6 +1869,8 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
             if app.dialog == Some(crate::Dialog::UnsavedChanges) {
                 app.dialog_state.unsaved.command = None;
             }
+            // Escape is Cancel: a Preview that edited the project rolls back.
+            crate::panels::live_preview::cancel(app);
             app.dialog = None;
         }
         return;
@@ -1971,6 +1976,10 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
                 crate::panels::forms::close_info(app);
                 continue;
             }
+            if app.dialog == Some(crate::Dialog::GradientEditor) {
+                crate::panels::gradient_editor::finish(app, false, ctx);
+                continue;
+            }
             // Escape in Settings is Cancel: restore the settings from when it opened.
             if app.dialog == Some(crate::Dialog::Settings)
                 && let Some(p) = app.dialog_state.prefs_snapshot.take()
@@ -1978,6 +1987,7 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
                 app.session.prefs = p;
                 app.session.prefs_changed();
             }
+            crate::panels::live_preview::cancel(app);
             app.dialog = None;
             continue;
         }
