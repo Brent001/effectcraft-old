@@ -293,9 +293,13 @@ impl<'a> Cx<'a> {
     /// Output frames `ks` for the H.264 encoder: the accelerator's planes
     /// ([`Cx::yuv420_frame`]) where it can, otherwise `rgba` of the frame rendered as usual.
     pub(crate) fn h264_frames(&self, comp: &Comp, ks: Vec<u64>, w: u32, h: u32, rgba: impl Fn(u64, Image) -> Vec<u8> + Sync + Send) -> Vec<H264Frame> {
-        map_frames(
+        // Stop limiting in-flight renders when the GPU is retired: remaining frames can use
+        // the normal parallel CPU path, matching the regular frame pipeline.
+        let gpu_live = || self.job.accel.is_none_or(|a| a.available());
+        map_frames_while(
             ks,
             self.gpu_cap(),
+            gpu_live,
             |k| match self.yuv420_frame(comp, k, w, h) {
                 Some(p) => H264Frame::Yuv420(p),
                 None => H264Frame::Rgba(rgba(k, self.frame(comp, k))),
