@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "apps/effectcraft/**"
+      - "apps/effectcraft-cli/**"
       - "crates/gpu/**"
       - "crates/ui-egui/**"
       - "crates/export/**"
