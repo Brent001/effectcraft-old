@@ -890,6 +890,23 @@ fn compositor_kernels_build_on_first_use() {
     check("lazy core compositor vs CPU", compare_at(&scene, opts(), Tick::ZERO), 0.0);
 }
 
+/// A failed lazy core kernel must decline the whole frame, not publish a partial image.
+#[test]
+fn failed_core_pipeline_declines_frame_for_cpu_fallback() {
+    if gpu().is_none() {
+        return;
+    }
+    let Ok(ctx) = pollster::block_on(crate::context::GpuContext::request()) else { return };
+    let mut g = Gpu::from_context(ctx);
+    std::sync::Arc::get_mut(&mut g.ctx).expect("the test GPU context is uniquely owned").drop_kernel("blend_full");
+    let mut scene = Scene::new(BitDepth::Bpc8);
+    let layer = scene.solid([0.25, 0.5, 0.75], 32, 24);
+    scene.push(layer);
+    let mut renderer = Renderer::new(&scene.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+    renderer.accel = Some(&g);
+    assert!(g.render(&renderer, scene.cid, Tick::ZERO).is_none(), "a frame with a missing core kernel must use the full CPU path");
+}
+
 
 
 /// The GPU Tint gives After Effects 2026's greys for full-frame solids at its defaults (sRGB
