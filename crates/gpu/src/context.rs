@@ -1246,7 +1246,6 @@ impl GpuContext {
             }
         }
     }
-    }
 
     /// The atlas kept for exactly these layer buffers (in this order), with their positions.
     /// Atlases of freed buffers are dropped here so they do not retain video memory indefinitely.
