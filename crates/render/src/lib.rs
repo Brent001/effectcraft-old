@@ -479,6 +479,14 @@ pub trait Accelerator: Send + Sync {
     /// and renders the frame again, and the steps whose results arrived are served from them.
     /// The frame is done after a pass with no miss. `frame_begin` forgets the previous frame's
     /// results, `pass_begin` clears the miss. Synchronous accelerators never miss.
+    /// Run an accelerator-supported chain and return a device copy of its final pixels when the
+    /// caller can hand that copy to the compositor upload cache. Other accelerators can use the
+    /// default implementation and return no hold.
+    fn effects_held(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<(Buf, Option<ChainHold>)> {
+        self.effects(chain, buf, levels).map(|out| (out, None))
+    }
+    /// Adopt a held device image for the unchanged cache buffer whose pixels it represents.
+    fn adopt(&self, _buf: &Arc<Buf>, _hold: ChainHold) {}
     fn frame_begin(&self) {}
     fn pass_begin(&self) {}
     fn pass_missed(&self) -> bool {
@@ -518,25 +526,52 @@ pub trait FxTarget {
     }
 }
 
+/// A device-side copy of a GPU effect-chain result tied to the exact CPU pixel allocation
+/// the result was read back into. The value is opaque to the renderer so `dyn Accelerator`
+/// remains object-safe; only the accelerator that created it can recover its image.
+pub struct ChainHold {
+    pixels: usize,
+    len: usize,
+    image: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl ChainHold {
+    pub fn new<T: std::any::Any + Send + Sync>(out: &Buf, image: T) -> ChainHold {
+        ChainHold { pixels: out.img.data.as_ptr() as usize, len: out.img.data.len(), image: Box::new(image) }
+    }
+
+    pub fn is_for(&self, buf: &Buf) -> bool {
+        self.pixels == buf.img.data.as_ptr() as usize && self.len == buf.img.data.len()
+    }
+
+    pub fn into_inner<T: std::any::Any>(self) -> Option<T> {
+        let image: Box<dyn std::any::Any> = self.image;
+        image.downcast::<T>().ok().map(|value| *value)
+    }
+}
+
 /// The CPU effect target (GPU chains go through [`Accelerator::effects`]: upload, readback).
 struct CpuFx<'a> {
     accel: Option<&'a dyn Accelerator>,
     levels: Option<f32>,
     buf: Option<Buf>,
+    hold: Option<ChainHold>,
 }
 
 impl FxTarget for CpuFx<'_> {
     fn gpu(&mut self, steps: &[FxStep]) -> bool {
         let (Some(a), Some(b)) = (self.accel, &self.buf) else { return false };
-        match a.effects(steps, b, self.levels) {
-            Some(out) => {
+        match a.effects_held(steps, b, self.levels) {
+            Some((out, hold)) => {
                 self.buf = Some(out);
+                self.hold = hold;
                 true
             }
             None => false,
         }
     }
     fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf) {
+        self.hold = None;
         if let Some(b) = self.buf.take() {
             self.buf = Some(f(b));
         }
@@ -1112,13 +1147,25 @@ impl<'a> Renderer<'a> {
 
     /// Run the first `limit` effects of the layer's stack (by position; disabled ones count) on
     /// `buf` (layer space, or the comp below for an adjustment layer).
-    fn apply_effects_timed(&self, ctx: &EvalCtx, layer: &Layer, mut buf: Buf, adjustment: bool, limit: usize, timing: Option<&mut Vec<(String, f64)>>) -> Buf {
-        // The comp below an adjustment layer is not in its layer space: it stays as it is.
+    fn apply_effects_timed(&self, ctx: &EvalCtx, layer: &Layer, buf: Buf, adjustment: bool, limit: usize, timing: Option<&mut Vec<(String, f64)>>) -> Buf {
+        self.apply_effects_held(ctx, layer, buf, adjustment, limit, timing).0
+    }
+
+    /// Run a stack and return any device copy that still matches its final, unchanged pixels.
+    fn apply_effects_held(
+        &self,
+        ctx: &EvalCtx,
+        layer: &Layer,
+        mut buf: Buf,
+        adjustment: bool,
+        limit: usize,
+        timing: Option<&mut Vec<(String, f64)>>,
+    ) -> (Buf, Option<ChainHold>) {
         let origin = if adjustment { [0.0; 2] } else { ctx.effect_bounds(layer).1 };
         buf.rebase(origin);
-        let mut out = self.effect_space_stack(ctx, layer, buf, adjustment, limit, timing, origin);
+        let (mut out, hold) = self.effect_space_stack(ctx, layer, buf, adjustment, limit, timing, origin);
         out.rebase([-origin[0], -origin[1]]);
-        out
+        (out, hold)
     }
 
     /// [`Renderer::apply_effects_timed`] on a buffer already in effect space (measured from
@@ -1133,10 +1180,11 @@ impl<'a> Renderer<'a> {
         limit: usize,
         timing: Option<&mut Vec<(String, f64)>>,
         origin: [f64; 2],
-    ) -> Buf {
-        let mut t = CpuFx { accel: self.active_accel(), levels: self.pipe.levels, buf: Some(buf) };
+    ) -> (Buf, Option<ChainHold>) {
+        let mut t = CpuFx { accel: self.active_accel(), levels: self.pipe.levels, buf: Some(buf), hold: None };
         self.run_effect_stack(ctx, layer, adjustment, limit, timing, origin, &mut t);
-        t.buf.unwrap_or_else(|| Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: self.opts.scale })
+        let hold = t.hold.take();
+        (t.buf.unwrap_or_else(|| Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: self.opts.scale }), hold)
     }
 
     /// Run the layer's video effect stack on `target` (in effect space, measured from `origin`
@@ -1490,10 +1538,10 @@ impl<'a> Renderer<'a> {
         let mut nb = (*b).clone();
         color::convert(&mut nb.img, &c);
         let nb = Arc::new(nb);
-        if let (Some(cache), Some(k)) = (self.cache_to_keep(), key) {
-            cache.insert(k, nb.clone());
+        match (self.cache_to_keep(), key) {
+            (Some(cache), Some(k)) => cache.insert(k, nb),
+            _ => nb,
         }
-        nb
     }
 
     fn layer_buf_keyed(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Arc<Buf>, Option<u64>)> {
@@ -1508,9 +1556,10 @@ impl<'a> Renderer<'a> {
             return Some((b, key));
         }
         let flat = Arc::new(styles::Styled { passes: st.passes.iter().map(|(b, m)| ((**b).clone(), *m)).collect(), body: (*st.body).clone() }.flatten());
-        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
-            c.insert(k, flat.clone());
-        }
+        let flat = match (self.cache_to_keep(), key) {
+            (Some(c), Some(k)) => c.insert(k, flat),
+            _ => flat,
+        };
         Some((flat, key))
     }
 
@@ -1537,10 +1586,16 @@ impl<'a> Renderer<'a> {
             }
             return Some((b, key));
         }
-        let buf = self.masked_source(ctx, layer)?;
-        let buf = Arc::new(self.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects)));
-        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
-            c.insert(k, buf.clone());
+        let (buf, hold) = self.apply_effects_held(ctx, layer, self.masked_source(ctx, layer)?, false, usize::MAX, timing.map(|t| &mut t.effects));
+        let buf = Arc::new(buf);
+        // Insert first: concurrent workers can return the buffer another worker cached. A hold
+        // is adopted only if its pixels still belong to the returned canonical buffer.
+        let buf = match (self.cache_to_keep(), key) {
+            (Some(c), Some(k)) => c.insert(k, buf),
+            _ => buf,
+        };
+        if let (Some(h), Some(a)) = (hold.filter(|h| h.is_for(&buf)), self.active_accel()) {
+            a.adopt(&buf, h);
         }
         Some((buf, key))
     }
@@ -1561,12 +1616,13 @@ impl<'a> Renderer<'a> {
         let origin = ctx.effect_bounds(layer).1;
         buf.rebase(origin);
         if effects > 0 {
-            buf = self.effect_space_stack(ctx, layer, buf, false, effects, None, origin);
+            buf = self.effect_space_stack(ctx, layer, buf, false, effects, None, origin).0;
         }
         let buf = Arc::new(buf);
-        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
-            c.insert(k, buf.clone());
-        }
+        let buf = match (self.cache_to_keep(), key) {
+            (Some(c), Some(k)) => c.insert(k, buf),
+            _ => buf,
+        };
         Some(buf)
     }
 
@@ -1594,12 +1650,12 @@ impl<'a> Renderer<'a> {
             t.cached = false;
             t.effects.push(("layerStyles".into(), t0.elapsed().as_secs_f64() * 1e3));
         }
-        let body = Arc::new(st.body);
-        let passes: Vec<_> = st.passes.into_iter().map(|(b, m)| (Arc::new(b), m)).collect();
+        let mut body = Arc::new(st.body);
+        let mut passes: Vec<_> = st.passes.into_iter().map(|(b, m)| (Arc::new(b), m)).collect();
         if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
-            c.insert(k, body.clone());
-            for (i, (b, _)) in passes.iter().enumerate() {
-                c.insert(cache::derive(k, i as u64 + 1), b.clone());
+            body = c.insert(k, body);
+            for (i, (b, _)) in passes.iter_mut().enumerate() {
+                *b = c.insert(cache::derive(k, i as u64 + 1), b.clone());
             }
         }
         Some(StyledLayer { passes, body, content, key, ckey, plain: false })
@@ -2255,9 +2311,10 @@ impl<'a> Renderer<'a> {
         let mut foot = self.source(ctx, layer)?;
         let _ = masks::apply(ctx, layer, &mut foot, self.mask_blur(ctx, layer));
         let foot = Arc::new(foot);
-        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
-            c.insert(k, foot.clone());
-        }
+        let foot = match (self.cache_to_keep(), key) {
+            (Some(c), Some(k)) => c.insert(k, foot),
+            _ => foot,
+        };
         Some(foot)
     }
 
@@ -2467,3 +2524,23 @@ mod tests_nested;
 mod tests_paint;
 #[cfg(test)]
 mod tests_time;
+
+
+#[cfg(test)]
+mod chain_hold_tests {
+    use super::*;
+
+    #[test]
+    fn chain_hold_matches_only_its_own_pixels() {
+        let out = Buf { img: Image::new(4, 4), offset: [0.0; 2], scale: 1.0 };
+        let hold = ChainHold::new(&out, 7u32);
+        assert!(hold.is_for(&out));
+        let copy = out.clone();
+        assert!(!hold.is_for(&copy));
+        let mut grown = out.clone();
+        grown.img = Image::new(8, 8);
+        assert!(!hold.is_for(&grown));
+        assert_eq!(ChainHold::new(&out, 7u32).into_inner::<u64>(), None);
+        assert_eq!(hold.into_inner::<u32>(), Some(7));
+    }
+}

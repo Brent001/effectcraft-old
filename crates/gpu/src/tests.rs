@@ -866,7 +866,47 @@ fn effect_kernels_build_on_first_use() {
     ctx.build_all_kernels();
     eprintln!("{}: built {} effect kernels in {:.2?}", ctx.name, built(&ctx), started.elapsed());
     assert_eq!(ctx.unavailable_kernels(), vec![], "every effect kernel builds on {}", ctx.name);
+} 
+
+/// Core compositor and sky pipelines are also lazy, so constructing the context does not
+/// synchronously compile kernels that the current project may never use.
+#[test]
+fn compositor_kernels_build_on_first_use() {
+    if gpu().is_none() {
+        return;
+    }
+    let Ok(ctx) = pollster::block_on(crate::context::GpuContext::request()) else { return };
+    assert_eq!(ctx.core_pipelines_built(), 0, "core pipelines must not compile during context setup");
+    let g = Gpu::from_context(ctx);
+    let mut scene = Scene::new(BitDepth::Bpc8);
+    let layer = scene.solid([0.25, 0.5, 0.75], 32, 24);
+    scene.push(layer);
+    let mut renderer = Renderer::new(&scene.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+    renderer.accel = Some(&g);
+    let image = g.render(&renderer, scene.cid, Tick::ZERO).expect("the simple comp should render on GPU");
+    assert_eq!(image.width, 32);
+    assert_eq!(image.height, 24);
+    assert!(g.context().core_pipelines_built() > 0, "compositing should build only the required core kernels");
+    check("lazy core compositor vs CPU", compare_at(&scene, opts(), Tick::ZERO), 0.0);
 }
+
+/// A failed lazy core kernel must decline the whole frame, not publish a partial image.
+#[test]
+fn failed_core_pipeline_declines_frame_for_cpu_fallback() {
+    if gpu().is_none() {
+        return;
+    }
+    let Ok(ctx) = pollster::block_on(crate::context::GpuContext::request()) else { return };
+    let mut g = Gpu::from_context(ctx);
+    std::sync::Arc::get_mut(&mut g.ctx).expect("the test GPU context is uniquely owned").drop_kernel("blend_full");
+    let mut scene = Scene::new(BitDepth::Bpc8);
+    let layer = scene.solid([0.25, 0.5, 0.75], 32, 24);
+    scene.push(layer);
+    let mut renderer = Renderer::new(&scene.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+    renderer.accel = Some(&g);
+    assert!(g.render(&renderer, scene.cid, Tick::ZERO).is_none(), "a frame with a missing core kernel must use the full CPU path");
+}
+
 
 
 /// The GPU Tint gives After Effects 2026's greys for full-frame solids at its defaults (sRGB
@@ -1140,4 +1180,98 @@ fn upload_cache_drops_textures_of_freed_buffers() {
     }
     let kept = g.ctx.upload_entries();
     assert!(kept <= before + 1, "the upload cache kept {kept} textures of freed buffers (had {before})");
+}
+
+
+/// Restores hand-off and upload budget after a GPU test, including a failed assertion.
+struct Restore(&'static Gpu, bool, usize);
+
+impl Restore {
+    fn new(g: &'static Gpu) -> Restore {
+        Restore(g, g.ctx.handoff.load(std::sync::atomic::Ordering::Relaxed), g.ctx.upload_budget())
+    }
+}
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        self.0.ctx.handoff.store(self.1, std::sync::atomic::Ordering::Relaxed);
+        self.0.ctx.set_upload_budget(self.2);
+    }
+}
+
+/// A handed-off image may be read by another encoder that has not submitted yet. When its cache
+/// entry disappears it must go to the shared released queue, never the original owner's private
+/// pool where that owner could overwrite it before the frame finishes reading.
+#[test]
+fn handed_off_texture_waits_for_open_encoders() {
+    let Some(g) = gpu() else { return };
+    let _restore = Restore::new(g);
+    let ctx = &g.ctx;
+    ctx.set_upload_budget(2 << 20);
+    let mut owner = crate::context::Enc::new(ctx);
+    let img = owner.image(300, 300);
+    let handed = img.texture.clone();
+    let buf = Arc::new(effectcraft_effects::Buf { img: Image::new(300, 300), offset: [0.0; 2], scale: 1.0 });
+    ctx.adopt_upload(&buf, img);
+
+    let mut frame = crate::context::Enc::new(ctx);
+    let seen = ctx.upload_buf(&buf).expect("uploads");
+    assert!(seen.texture == handed, "the adopted image was not used for the upload");
+    let _ = frame.encoder();
+    drop(seen);
+    drop(buf);
+
+    let parked = ctx.escaped_parked();
+    let other = Arc::new(effectcraft_effects::Buf { img: Image::new(300, 300), offset: [0.0; 2], scale: 1.0 });
+    let _other = ctx.upload_buf(&other);
+    assert_eq!(ctx.escaped_parked(), parked + 1, "the handed-off texture wasn't released while an encoder remained open");
+
+    let again = owner.image(300, 300);
+    let elsewhere = crate::context::Enc::new(ctx).image(300, 300);
+    assert!(again.texture != handed, "the owner reused a handed-off texture while the frame may still read it");
+    assert!(elsewhere.texture != handed, "a handed-off texture left the pool before the frame's encoder submitted");
+    drop(frame);
+}
+
+/// Several same-sized effect chains whose layer buffers die mid-frame must not overwrite each
+/// other's device-resident outputs. Compare both GPU hand-off modes to the CPU renderer.
+#[test]
+fn handoff_survives_layer_buffers_dying_mid_frame() {
+    let Some(g) = gpu() else { return };
+    let _restore = Restore::new(g);
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let mut s = Scene::new(BitDepth::Bpc8);
+    let colors = [[0.9, 0.2, 0.1], [0.1, 0.8, 0.2], [0.2, 0.3, 0.9], [0.9, 0.8, 0.1], [0.7, 0.1, 0.8]];
+    for (i, c) in colors.into_iter().enumerate() {
+        let mut l = s.solid(c, 200, 200);
+        set(&mut l, "transform/position", v3(10.0 + 18.0 * i as f64, 10.0 + 10.0 * i as f64));
+        set(&mut l, "transform/scale", Value::Vec3([20.0, 20.0, 100.0]));
+        s.effect(&mut l, "ec.blur.gaussian", &[("blurriness", n(6.0))]);
+        s.effect(&mut l, "ec.stylize.glow", &[("threshold", n(40.0)), ("radius", n(10.0)), ("intensity", n(1.5))]);
+        s.push(l);
+    }
+    let t = Tick::from_seconds_f64(0.5);
+    let cache = effectcraft_render::cache::LayerCache::new(0);
+    let render = |handoff: bool| {
+        g.ctx.handoff.store(handoff, Relaxed);
+        let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+        r.accel = Some(g);
+        r.cache = Some(&cache);
+        let img = g.render(&r, s.cid, t).expect("the GPU renders the frame");
+        g.ctx.clear_uploads();
+        img
+    };
+    g.ctx.set_upload_budget(3 << 19);
+    let parked = g.ctx.escaped_parked();
+    let on = render(true);
+    let swept = g.ctx.escaped_parked() - parked;
+    assert!(swept >= colors.len() as u64 - 1, "only {swept} handed-off results were released mid-frame");
+    let off = render(false);
+    let cpu = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Cpu, ..opts() }).comp_frame_cpu(s.cid, t);
+
+    let mut d = diff(&cpu, &on, tolerance(BitDepth::Bpc8));
+    d.quantized = true;
+    check("effect hand-off with temporary layer buffers vs CPU", Some(d), 0.0);
+    assert!(on.data == off.data, "the hand-off changed pixels (max diff {})", diff(&off, &on, 0.0).max * 255.0);
 }

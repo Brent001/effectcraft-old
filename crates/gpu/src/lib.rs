@@ -178,6 +178,12 @@ impl Gpu {
         Some((d.passes.load(std::sync::atomic::Ordering::Relaxed), d.readbacks.load(std::sync::atomic::Ordering::Relaxed), d.in_flight()))
     }
 
+    /// Toggle keeping GPU effect-chain outputs resident for the compositor. Enabled by default;
+    /// disable for comparative benchmarks or to diagnose a driver-specific hand-off issue.
+    pub fn set_handoff(&self, on: bool) {
+        self.ctx.handoff.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn context(&self) -> &GpuContext {
         &self.ctx
     }
@@ -192,6 +198,11 @@ impl Gpu {
         self.ctx.check_health().map_err(|e| log::error!("gpu display: {e}")).ok()?;
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
+        // A lazy core kernel may fail on an older driver. Never publish a partially composited
+        // frame: let the caller render the entire frame on the CPU instead.
+        if e.take_missing() || e.take_core_missing() {
+            return None;
+        }
         let texture = e.display(&img);
         e.submit();
         // Reject failures observed during rendering/submission before publishing the frame.
@@ -227,6 +238,9 @@ impl Gpu {
         }
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
+        if e.take_missing() || e.take_core_missing() {
+            return None;
+        }
         e.download(&img)
     }
 
@@ -256,6 +270,9 @@ impl Gpu {
         let misses = d.misses();
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
+        if e.take_missing() || e.take_core_missing() {
+            return None;
+        }
         if d.misses() != misses {
             // Layer steps are still in flight: this pass's canvas is not the frame.
             return Some(Image::new(1, 1));
@@ -353,6 +370,9 @@ impl Accelerator for Gpu {
         }
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
+        if e.take_missing() || e.take_core_missing() {
+            return None;
+        }
         let yp = self.ctx.yuv.get_or_init(|| yuv::YuvPipe::new(&self.ctx.device));
         let planes = yuv::convert(&mut e, yp, &img, bg)?;
         // A device fault seen while the frame recorded makes the planes untrustworthy.
@@ -367,6 +387,19 @@ impl Accelerator for Gpu {
     fn effects(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<Buf> {
         self.ctx.check_health().ok()?;
         effects::run_chain(&mut Enc::new(&self.ctx), chain, buf, levels)
+    }
+
+    fn effects_held(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<(Buf, Option<effectcraft_render::ChainHold>)> {
+        self.ctx.check_health().ok()?;
+        let (out, img) = effects::run_chain_held(&mut Enc::new(&self.ctx), chain, buf, levels)?;
+        let hold = img.map(|img| effectcraft_render::ChainHold::new(&out, img));
+        Some((out, hold))
+    }
+
+    fn adopt(&self, buf: &Arc<Buf>, hold: effectcraft_render::ChainHold) {
+        if let Some(img) = hold.into_inner::<GpuImage>() {
+            self.ctx.adopt_upload(buf, img);
+        }
     }
 
     fn raster_3d(&self, scene: &effectcraft_render::three_d::adv::Scene) -> Option<effectcraft_render::three_d::adv::Target> {

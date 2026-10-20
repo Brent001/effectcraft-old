@@ -403,13 +403,37 @@ fn crypto_matte(planes: &RankPlanes, sel: &[u32], i: usize) -> f32 {
         .clamp(0.0, 1.0)
 }
 
+/// The last ID colour seen at each rank in this worker. Adjacent pixels commonly reuse
+/// IDs, so this avoids hashing and converting HSL for most of those pixels.
+#[derive(Default)]
+struct IdColorMemo(Vec<(u32, [f32; 3])>);
+
+impl IdColorMemo {
+    #[inline]
+    fn get(&mut self, rank: usize, id: f32) -> [f32; 3] {
+        let bits = id.to_bits();
+        match self.0.get_mut(rank) {
+            Some(e) if e.0 == bits => e.1,
+            Some(e) => {
+                *e = (bits, id_color(id));
+                e.1
+            }
+            None => {
+                let colour = id_color(id);
+                self.0.resize(rank + 1, (bits, colour));
+                colour
+            }
+        }
+    }
+}
+
 /// The coverage-weighted ID colours at aux pixel `i` (the spec's preview).
 #[inline]
-fn crypto_colors(planes: &RankPlanes, i: usize) -> [f32; 3] {
+fn crypto_colors(planes: &RankPlanes, i: usize, memo: &mut IdColorMemo) -> [f32; 3] {
     let mut c = [0.0f32; 3];
-    for (id, cov) in planes {
+    for (rank, (id, cov)) in planes.iter().enumerate() {
         let (Some(&id), Some(&cov)) = (id.get(i), cov.get(i)) else { continue };
-        let k = id_color(id);
+        let k = memo.get(rank, id);
         for j in 0..3 {
             c[j] += k[j] * cov;
         }
@@ -417,14 +441,36 @@ fn crypto_colors(planes: &RankPlanes, i: usize) -> [f32; 3] {
     c
 }
 
-/// Per aux pixel of Cryptomatte layer `layer`: the coverage-weighted ID colours (RGB) and the
-/// selection's coverage (A), computed in parallel with the rank planes resolved once. The GPU
-/// effect uploads this image and samples it per layer pixel.
+/// What `crypto_aux_image_with` computes per aux pixel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CryptoAux {
+    /// Coverage-weighted ID colours and selection coverage.
+    ColorsAndMatte,
+    /// Selection coverage only (RGB remains zero).
+    MatteOnly,
+}
+
+impl CryptoAux {
+    /// ID colours are needed only by the Colors display when Matte Only is disabled.
+    pub fn for_display(display: u32, matte_only: bool) -> Self {
+        if display == 0 && !matte_only { Self::ColorsAndMatte } else { Self::MatteOnly }
+    }
+}
+
+/// Per aux pixel of Cryptomatte layer `layer`. The GPU effect uploads this image and samples it
+/// per layer pixel. Displays that do not read ID colours compute only the matte (alpha) channel.
 pub fn crypto_aux_image(a: &AuxChannels, layer: &str, sel: &[u32]) -> Image {
+    crypto_aux_image_with(a, layer, sel, CryptoAux::ColorsAndMatte)
+}
+
+pub fn crypto_aux_image_with(a: &AuxChannels, layer: &str, sel: &[u32], what: CryptoAux) -> Image {
     let planes = a.crypto_rank_planes(layer);
     let mut img = Image::new(a.width, a.height);
-    img.data.par_iter_mut().enumerate().for_each(|(i, px)| {
-        let c = crypto_colors(&planes, i);
+    img.data.par_iter_mut().enumerate().for_each_init(IdColorMemo::default, |memo, (i, px)| {
+        let c = match what {
+            CryptoAux::ColorsAndMatte => crypto_colors(&planes, i, memo),
+            CryptoAux::MatteOnly => [0.0; 3],
+        };
         *px = [c[0], c[1], c[2], crypto_matte(&planes, sel, i)];
     });
     img
@@ -444,9 +490,8 @@ fn cryptomatte(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let display = ctx.params.e("display");
     let matte_only = ctx.params.b("matteOnly");
     let planes = a.crypto_rank_planes(&layer);
-    let src = b.img.clone();
-    b.img.data.par_iter_mut().enumerate().for_each(|(i, px)| {
-        let m = idx[i].map_or(0.0, |k| crypto_matte(&planes, &sel, k));
+    b.img.data.par_iter_mut().zip(idx.par_iter()).for_each_init(IdColorMemo::default, |memo, (px, &k)| {
+        let m = k.map_or(0.0, |k| crypto_matte(&planes, &sel, k));
         if matte_only {
             *px = [m, m, m, m];
             return;
@@ -454,16 +499,16 @@ fn cryptomatte(ctx: &EffectCtx, mut b: Buf) -> Buf {
         *px = match display {
             // Colors: coverage-weighted ID colours (the spec's preview), selection brighter.
             0 => {
-                let c = idx[i].map_or([0.0; 3], |k| crypto_colors(&planes, k));
+                let c = k.map_or([0.0; 3], |k| crypto_colors(&planes, k, memo));
                 let c = c.map(|v| v * (1.0 - 0.5 * m) + 0.5 * m);
                 [c[0], c[1], c[2], 1.0]
             }
-            // Matte: the layer keyed by the selection.
-            1 => src.data[i].map(|v| v * m),
+            // Matte: the layer keyed by the selection; each pixel reads and writes only itself.
+            1 => px.map(|v| v * m),
             // Preview: the layer with the selection tinted.
             _ => {
-                let s = src.data[i];
-                [s[0] * (1.0 - 0.5 * m) + 0.5 * m * s[3], s[1] * (1.0 - 0.5 * m) + 0.5 * m * s[3], s[2] * (1.0 - 0.5 * m), s[3]]
+                let source = *px;
+                [source[0] * (1.0 - 0.5 * m) + 0.5 * m * source[3], source[1] * (1.0 - 0.5 * m) + 0.5 * m * source[3], source[2] * (1.0 - 0.5 * m), source[3]]
             }
         };
     });
@@ -840,6 +885,41 @@ mod tests {
             let want = [c[0], c[1], c[2], m];
             assert_eq!(img.data[i].map(f32::to_bits), want.map(f32::to_bits), "pixel {i}");
             assert_eq!(img.data[i].map(f32::to_bits), without_gap_rank.data[i].map(f32::to_bits), "pixel {i}: the rank after the gap was used");
+        }
+    } 
+
+    #[test]
+    fn id_color_memo_matches_id_color() {
+        let a = edge_aux(true);
+        let planes = a.crypto_rank_planes("CryptoObject");
+        let mut memo = IdColorMemo::default();
+        for i in 0..12 {
+            for (rank, (ids, _)) in planes.iter().enumerate() {
+                assert_eq!(memo.get(rank, ids[i]).map(f32::to_bits), id_color(ids[i]).map(f32::to_bits), "pixel {i} rank {rank}");
+            }
+        }
+    }
+
+    #[test]
+    fn crypto_aux_without_colors_preserves_matte() {
+        let a = edge_aux(true);
+        let sel = edge_selection();
+        let full = crypto_aux_image(&a, "CryptoObject", &sel);
+        let matte = crypto_aux_image_with(&a, "CryptoObject", &sel, CryptoAux::MatteOnly);
+        for (full, matte) in full.data.iter().zip(&matte.data) {
+            assert_eq!(full[3].to_bits(), matte[3].to_bits());
+            assert_eq!(matte[..3], [0.0; 3]);
+        }
+    }
+
+    #[test]
+    fn crypto_aux_for_display_reads_colors_only_for_color_display() {
+        assert_eq!(CryptoAux::for_display(0, false), CryptoAux::ColorsAndMatte);
+        assert_eq!(CryptoAux::for_display(0, true), CryptoAux::MatteOnly);
+        for display in [1, 2, 3, u32::MAX] {
+            for matte_only in [false, true] {
+                assert_eq!(CryptoAux::for_display(display, matte_only), CryptoAux::MatteOnly);
+            }
         }
     }
 
