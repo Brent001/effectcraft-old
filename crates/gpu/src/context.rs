@@ -24,14 +24,60 @@ const ENTRIES: &[&str] = &[
     "fill",
 ];
 
-/// Effect entry points in `kernels.wgsl`. Like the `fx_*` kernels, one that fails to build
-/// (a driver's shader compiler rejecting it, #613) leaves its effects to the CPU instead of
-/// turning the whole compositor off.
+/// Effect entry points in `kernels.wgsl`. Like the `fx_*` kernels, they are built on first use
+/// (building all ~200 up front kept Chrome's GPU process busy past its watchdog, #1590, and
+/// FXC took over a minute, #613), and one that fails to build (a driver's shader compiler
+/// rejecting it) leaves its effects to the CPU instead of turning the whole compositor off.
 const EFFECT_ENTRIES: &[&str] = &["box_h", "box_v", "directional", "glow_bright", "glow_combine", "shadow_make", "shadow_combine", "pointwise"];
 
 /// Entry points that also bind group 1 (four read-only storage buffers; see
 /// [`Enc::dispatch_ext`]).
 const EXT_ENTRIES: &[&str] = &["classic3d"];
+
+/// What every kernel module starts with: the shared helpers and bindings, and `kernels.wgsl`
+/// (the compositor's kernels, which declare `out` and helpers the effect files use).
+const BASE_WGSL: [&str; 2] = [include_str!("shaders/common.wgsl"), include_str!("shaders/kernels.wgsl")];
+
+/// Kernel families: each is compiled as a module of its own, `BASE_WGSL` plus its file and the
+/// files it borrows functions from, built the first time one of its kernels is. A pipeline then
+/// compiles at most ~120K characters of WGSL instead of all ~460K: on WebGPU each pipeline
+/// compiles its module again, and the page's and its workers' devices doing that for every
+/// kernel kept Chrome's GPU process busy past its watchdog (#1590). Family 0 is the base module.
+const FAMILIES: &[(&str, &[&str], &[&str])] = &[
+    ("kernels", &[], EFFECT_ENTRIES),
+    ("fx_color", &[include_str!("shaders/fx_lut.wgsl"), include_str!("shaders/fx_color.wgsl")], crate::fx_color::KERNELS),
+    ("fx_distort", &[include_str!("shaders/fx_distort.wgsl")], crate::fx_distort::KERNELS),
+    ("fx_generate", &[include_str!("shaders/fx_generate.wgsl")], crate::fx_generate::KERNELS),
+    ("fx_key", &[include_str!("shaders/fx_distort.wgsl"), include_str!("shaders/fx_key.wgsl")], crate::fx_key::KERNELS),
+    ("fx_stylize", &[include_str!("shaders/fx_stylize.wgsl")], crate::fx_stylize::KERNELS),
+    ("fx_noise", &[include_str!("shaders/fx_noise.wgsl")], crate::fx_noise::KERNELS),
+    ("fx_tone", &[include_str!("shaders/fx_tone.wgsl")], crate::fx_tone::KERNELS),
+    ("fx_warp", &[include_str!("shaders/fx_warp.wgsl")], crate::fx_warp::KERNELS),
+    ("fx_extra", &[include_str!("shaders/fx_generate.wgsl"), include_str!("shaders/fx_extra.wgsl")], crate::fx_extra::KERNELS),
+    ("fx_depth", &[include_str!("shaders/fx_depth.wgsl")], crate::fx_depth::KERNELS),
+    ("fx_lut", &[include_str!("shaders/fx_lut.wgsl")], crate::fx_lut::KERNELS),
+    ("fx_sim", &[include_str!("shaders/fx_sim.wgsl")], crate::fx_sim::KERNELS),
+    (
+        "fx_particles",
+        &[include_str!("shaders/fx_stylize.wgsl"), include_str!("shaders/fx_sim.wgsl"), include_str!("shaders/fx_particles.wgsl")],
+        crate::fx_particles::KERNELS,
+    ),
+    ("fx_vr", &[include_str!("shaders/fx_vr.wgsl")], crate::fx_vr::KERNELS),
+    ("fx_light", &[include_str!("shaders/fx_light.wgsl")], crate::fx_light::KERNELS),
+    ("fx_transition", &[include_str!("shaders/fx_transition.wgsl")], crate::fx_transition::KERNELS),
+    ("fx_text", &[include_str!("shaders/fx_text.wgsl")], crate::fx_text::KERNELS),
+    ("fx_time", &[include_str!("shaders/fx_time.wgsl")], crate::fx_time::KERNELS),
+    ("fx_pixel2", &[include_str!("shaders/fx_stylize.wgsl"), include_str!("shaders/fx_pixel2.wgsl")], crate::fx_pixel2::KERNELS),
+    ("fx_gen2", &[include_str!("shaders/fx_gen2.wgsl")], crate::fx_gen2::KERNELS),
+];
+
+/// Module `label`: `BASE_WGSL` followed by `files`.
+fn kernel_module(device: &wgpu::Device, label: &str, files: &[&str]) -> Result<wgpu::ShaderModule, String> {
+    let src: String = BASE_WGSL.iter().chain(files).copied().collect();
+    init_resource(device, &format!("{label} shader module"), || {
+        device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(src.into()) })
+    })
+}
 
 /// Pixel format of every working texture: premultiplied RGBA, 32-bit float (32 bpc headroom;
 /// 8/16 bpc are emulated by clamping and quantising, as on the CPU).
@@ -361,9 +407,16 @@ pub struct GpuContext {
     pub(crate) max_dim: u32,
     bgl: wgpu::BindGroupLayout,
     bgl_ext: wgpu::BindGroupLayout,
+    /// Each of `FAMILIES`' modules, built with its first kernel; and their group 0 layout.
+    modules: Vec<std::sync::OnceLock<Result<wgpu::ShaderModule, String>>>,
+    layout: wgpu::PipelineLayout,
+    /// The compositor's own kernels (built up front: the compositor can't run without them).
     pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
-    /// Effect kernels that failed to build, and why (their effects render on the CPU).
+    /// Core or Classic 3D kernels the driver could not build (these paths fall back to the CPU).
     unavailable: Vec<(&'static str, String)>,
+    /// Effect kernels with their family (index in `FAMILIES`), built on first dispatch; `Err`
+    /// says why one didn't build (its effects render on the CPU).
+    effect_pipelines: HashMap<&'static str, (usize, std::sync::OnceLock<Result<wgpu::ComputePipeline, String>>)>,
     display_bgl: wgpu::BindGroupLayout,
     display: wgpu::ComputePipeline,
     /// The display texture's next mip level from the one above (`display.wgsl` `mip`).
@@ -448,6 +501,25 @@ fn init_resource<T>(_device: &wgpu::Device, _label: &str, create: impl FnOnce() 
     Ok(create())
 }
 
+/// Compute pipeline `entry` of `module`; a shader compiler rejecting it (FXC, #613) is an `Err`.
+fn build_pipeline(
+    device: &wgpu::Device,
+    module: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    entry: &'static str,
+) -> Result<wgpu::ComputePipeline, String> {
+    init_resource(device, entry, || {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(layout),
+            module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    })
+}
+
 /// A buffer holding `contents` (padded to 4 bytes), written through the queue. Unlike
 /// `DeviceExt::create_buffer_init`, which maps the buffer at creation and panics when the
 /// allocation failed (a driver reports it as an internal error, not out-of-memory: Adreno's
@@ -517,36 +589,7 @@ impl GpuContext {
         if let Some(why) = &adv3d_unsupported {
             log::info!("gpu {name}: Advanced 3D renders on the CPU ({why})");
         }
-        let src = [
-            include_str!("shaders/common.wgsl"),
-            include_str!("shaders/kernels.wgsl"),
-            include_str!("shaders/classic3d.wgsl"),
-            include_str!("shaders/fx_color.wgsl"),
-            include_str!("shaders/fx_distort.wgsl"),
-            include_str!("shaders/fx_generate.wgsl"),
-            include_str!("shaders/fx_key.wgsl"),
-            include_str!("shaders/fx_stylize.wgsl"),
-            include_str!("shaders/fx_noise.wgsl"),
-            include_str!("shaders/fx_tone.wgsl"),
-            include_str!("shaders/fx_warp.wgsl"),
-            include_str!("shaders/fx_extra.wgsl"),
-            include_str!("shaders/fx_depth.wgsl"),
-            include_str!("shaders/fx_lut.wgsl"),
-            include_str!("shaders/fx_sim.wgsl"),
-            include_str!("shaders/fx_particles.wgsl"),
-            include_str!("shaders/fx_vr.wgsl"),
-            include_str!("shaders/fx_light.wgsl"),
-            include_str!("shaders/fx_transition.wgsl"),
-            include_str!("shaders/fx_text.wgsl"),
-            include_str!("shaders/fx_time.wgsl"),
-            include_str!("shaders/fx_pixel2.wgsl"),
-            include_str!("shaders/fx_gen2.wgsl"),
-            include_str!("shaders/sky.wgsl"),
-        ]
-        .concat();
-        let module = init_resource(&device, "kernels shader module", || {
-            device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("effectcraft kernels"), source: wgpu::ShaderSource::Wgsl(src.into()) })
-        })?;
+        let module = kernel_module(&device, "effectcraft kernels", &[])?;
         let bgl = init_resource(&device, "kernels bind-group layout", || {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("effectcraft kernels"),
@@ -599,71 +642,33 @@ impl GpuContext {
                 immediate_size: 0,
             })
         })?;
-        let build = |e: &'static str, layout: &wgpu::PipelineLayout| {
-            init_resource(&device, e, || {
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(e),
-                    layout: Some(layout),
-                    module: &module,
-                    entry_point: Some(e),
-                    compilation_options: Default::default(),
-                    cache: None,
-                })
-            })
-        };
-        // Core compositing and sky kernels are required. Classic 3D is optional like an effect:
-        // FXC on DirectX 12 can reject its dynamic component writes, so its 3D runs then render on
-        // the CPU instead of disabling the entire compositor.
+        let sky = kernel_module(&device, "effectcraft sky", &[include_str!("shaders/sky.wgsl")])?;
+        let classic3d = kernel_module(&device, "effectcraft classic3d", &[include_str!("shaders/classic3d.wgsl")])?;
         let mut pipelines = ENTRIES
             .iter()
-            .chain(crate::adv3d::SKY_KERNELS)
-            .map(|e| Ok((*e, build(e, &layout)?)))
+            .map(|e| Ok((*e, build_pipeline(&device, &module, &layout, e)?)))
             .collect::<Result<HashMap<_, _>, String>>()?;
+        for e in crate::adv3d::SKY_KERNELS.iter().copied() {
+            pipelines.insert(e, build_pipeline(&device, &sky, &layout, e)?);
+        }
+        // Classic 3D stays optional: older Intel/FXC drivers can reject its component writes.
         let mut unavailable = vec![];
         for e in EXT_ENTRIES {
-            match build(e, &layout_ext) {
-                Ok(p) => {
-                    pipelines.insert(*e, p);
-                }
+            match build_pipeline(&device, &classic3d, &layout_ext, e) {
+                Ok(p) => { pipelines.insert(*e, p); }
                 Err(why) => {
                     log::warn!("gpu {name}: kernel {e} unavailable, its 3D layers render on the CPU: {why}");
                     unavailable.push((*e, why));
                 }
             }
         }
-        for e in EFFECT_ENTRIES
-            .iter()
-            .chain(crate::fx_color::KERNELS)
-            .chain(crate::fx_distort::KERNELS)
-            .chain(crate::fx_generate::KERNELS)
-            .chain(crate::fx_key::KERNELS)
-            .chain(crate::fx_stylize::KERNELS)
-            .chain(crate::fx_noise::KERNELS)
-            .chain(crate::fx_tone::KERNELS)
-            .chain(crate::fx_warp::KERNELS)
-            .chain(crate::fx_extra::KERNELS)
-            .chain(crate::fx_depth::KERNELS)
-            .chain(crate::fx_lut::KERNELS)
-            .chain(crate::fx_sim::KERNELS)
-            .chain(crate::fx_particles::KERNELS)
-            .chain(crate::fx_vr::KERNELS)
-            .chain(crate::fx_light::KERNELS)
-            .chain(crate::fx_transition::KERNELS)
-            .chain(crate::fx_text::KERNELS)
-            .chain(crate::fx_time::KERNELS)
-            .chain(crate::fx_pixel2::KERNELS)
-            .chain(crate::fx_gen2::KERNELS)
-        {
-            match build(e, &layout) {
-                Ok(p) => {
-                    pipelines.insert(*e, p);
-                }
-                Err(why) => {
-                    log::warn!("gpu {name}: kernel {e} unavailable, its effects render on the CPU: {why}");
-                    unavailable.push((*e, why));
-                }
-            }
-        }
+        let effect_pipelines =
+            FAMILIES.iter().enumerate().flat_map(|(family, (_, _, kernels))| {
+                kernels.iter().map(move |e| (*e, (family, std::sync::OnceLock::new())))
+            }).collect();
+        let modules = std::iter::once(std::sync::OnceLock::from(Ok(module)))
+            .chain(FAMILIES.iter().skip(1).map(|_| std::sync::OnceLock::new()))
+            .collect();
         let dmodule = init_resource(&device, "display shader module", || {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("effectcraft display"),
@@ -720,8 +725,11 @@ impl GpuContext {
             max_dim,
             bgl,
             bgl_ext,
+            modules,
+            layout,
             pipelines,
             unavailable,
+            effect_pipelines,
             display_bgl,
             display,
             display_mip,
@@ -911,18 +919,65 @@ impl GpuContext {
     /// Whether a kernel is available (Classic 3D and effect kernels may fall back to the CPU).
     pub(crate) fn has_kernel(&self, entry: &str) -> bool {
         self.pipelines.contains_key(entry)
+            || self.effect_pipelines.get(entry).is_some_and(|(_, cell)| !matches!(cell.get(), Some(Err(_))))
     }
 
-    /// Effect kernels the device couldn't build, with why: their effects render on the CPU.
-    pub fn unavailable_kernels(&self) -> &[(&'static str, String)] {
-        &self.unavailable
+    /// Effect kernels unavailable so far; unused lazy kernels are not listed.
+    pub fn unavailable_kernels(&self) -> Vec<(&'static str, String)> {
+        let mut out = self.unavailable.clone();
+        out.extend(self.effect_pipelines.iter().filter_map(|(entry, (_, cell))| match cell.get() {
+            Some(Err(why)) => Some((*entry, why.clone())),
+            _ => None,
+        }));
+        out.sort_unstable_by_key(|(entry, _)| *entry);
+        out
     }
 
-    /// Leave kernel `entry` out, as if it had failed to build (tests of the CPU fallback).
+    /// Get a compositor or effect pipeline, compiling effect kernels on first use.
+    fn pipeline(&self, entry: &str) -> Option<&wgpu::ComputePipeline> {
+        if let Some(p) = self.pipelines.get(entry) { return Some(p); }
+        let Some((e, (family, cell))) = self.effect_pipelines.get_key_value(entry) else {
+            log::error!("gpu: no kernel {entry}");
+            return None;
+        };
+        let built = cell.get_or_init(|| {
+            let built = self.family_module(*family).and_then(|module| build_pipeline(&self.device, module, &self.layout, *e));
+            if let Err(why) = &built {
+                log::warn!("gpu {}: kernel {e} unavailable, its effects render on the CPU: {why}", self.name);
+            }
+            built
+        });
+        built.as_ref().ok()
+    }
+
+    /// Get a family module, compiling that smaller WGSL module on first use.
+    fn family_module(&self, family: usize) -> Result<&wgpu::ShaderModule, String> {
+        let (Some((label, files, _)), Some(cell)) = (FAMILIES.get(family), self.modules.get(family)) else {
+            return Err(format!("no kernel family {family}"));
+        };
+        cell.get_or_init(|| kernel_module(&self.device, label, files)).as_ref().map_err(Clone::clone)
+    }
+
+    /// Build all lazy effect kernels, used by validation tests and hosts wanting up-front compilation.
+    pub fn build_all_kernels(&self) {
+        for entry in self.effect_pipelines.keys() { let _ = self.pipeline(entry); }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn effect_pipelines_built(&self) -> usize {
+        self.effect_pipelines.values().filter(|(_, cell)| matches!(cell.get(), Some(Ok(_)))).count()
+    }
+
+    /// Leave a kernel out, as if it had failed to build (tests of the CPU fallback).
     #[cfg(test)]
     pub(crate) fn drop_kernel(&mut self, entry: &'static str) {
         self.pipelines.remove(entry);
-        self.unavailable.push((entry, "dropped by a test".into()));
+        if let Some((family, _)) = self.effect_pipelines.get(entry) {
+            let family = *family;
+            self.effect_pipelines.insert(entry, (family, std::sync::OnceLock::from(Err("dropped by a test".into()))));
+        } else {
+            self.unavailable.push((entry, "dropped by a test".into()));
+        }
     }
 
     /// Bytes of readback staging buffers kept for reuse (tests).
@@ -1213,10 +1268,7 @@ impl<'g> Enc<'g> {
         ext: Option<[&wgpu::Buffer; 4]>,
     ) {
         let g = self.g;
-        let Some(pipe) = g.pipelines.get(entry) else {
-            if !g.unavailable.iter().any(|(e, _)| *e == entry) {
-                log::error!("gpu: no kernel {entry}");
-            }
+        let Some(pipe) = g.pipeline(entry) else {
             self.missing = true;
             return;
         };
