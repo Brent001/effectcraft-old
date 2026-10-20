@@ -911,6 +911,16 @@ fn shader_constants_match_the_cpu() {
     assert!(kernels.contains(&format!("powz(abs(c[i]), {gamma})")) && kernels.contains(&format!("1.0 / {gamma})"), "Exposure's power in kernels.wgsl is not {gamma}");
 }
 
+/// WGSL cannot read the CPU's constants, so Glow's bright pass repeats them as literals; this
+/// ties them to `effectcraft_effects::GLOW_GAIN` / `GLOW_KNEE` (runs without a GPU).
+#[test]
+fn glow_constants_match_the_cpu() {
+    use effectcraft_effects::{GLOW_GAIN, GLOW_KNEE};
+    let kernels = include_str!("shaders/kernels.wgsl");
+    let want = format!("max({GLOW_GAIN:?} * (px.xyz / a - vec3<f32>(thr - {GLOW_KNEE:?})), vec3<f32>(0.0))");
+    assert!(kernels.contains(&want), "Glow's bright pass in kernels.wgsl is not `{want}`");
+}
+
 /// A layer whose bounds change every frame reads back at a new size each time: the staging
 /// buffers kept for reuse stay within budget instead of growing for the whole render (#2081).
 #[test]
