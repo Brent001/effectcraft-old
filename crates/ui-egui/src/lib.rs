@@ -317,6 +317,10 @@ pub struct EffectcraftApp {
     gpu_init_rx: Option<Receiver<Result<effectcraft_gpu::Gpu, String>>>,
     #[cfg(not(target_arch = "wasm32"))]
     gpu_init_render_state: Option<eframe::egui_wgpu::RenderState>,
+    /// When the native compositor initialization worker started. Prevents an old GPU driver
+    /// from leaving the report on "initializing" indefinitely.
+    #[cfg(not(target_arch = "wasm32"))]
+    gpu_init_started: Option<std::time::Instant>,
     gpu_failures: Option<gpu_failure::GpuFailureBridge>,
     gpu_failure_applied: Option<bool>,
     /// The graphics device was lost and the window is closing (see `close_after_device_loss`);
@@ -416,6 +420,8 @@ impl EffectcraftApp {
             gpu_init_rx: None,
             #[cfg(not(target_arch = "wasm32"))]
             gpu_init_render_state: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            gpu_init_started: None,
             gpu_failures: None,
             gpu_failure_applied: None,
             device_lost_close: None,
@@ -822,6 +828,7 @@ impl EffectcraftApp {
                 Ok(_) => {
                     self.gpu_init_rx = Some(rx);
                     self.gpu_init_render_state = Some(rs.clone());
+                    self.gpu_init_started = Some(std::time::Instant::now());
                     self.session.accel_note =
                         Some("GPU compositor is initializing in the background; CPU compositing remains active until it is ready.".into());
                     log::info!("GPU compositor: pipeline initialization started in background for {} ({:?})", info.name, info.backend);
@@ -855,6 +862,17 @@ impl EffectcraftApp {
         if self.gpu_failures.as_ref().is_some_and(|bridge| bridge.failure().is_some()) {
             self.gpu_init_rx = None;
             self.gpu_init_render_state = None;
+            self.gpu_init_started = None;
+            return;
+        }
+        const GPU_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        if self.gpu_init_started.is_some_and(|started| started.elapsed() >= GPU_INIT_TIMEOUT) {
+            self.gpu_init_rx = None;
+            self.gpu_init_render_state = None;
+            self.gpu_init_started = None;
+            let reason = "GPU compositor initialization exceeded 30 seconds; CPU compositing remains active. Check Logs/effectcraft.log for GPU errors, or change Window Graphics and restart to retry.".to_string();
+            log::error!("{reason}");
+            self.session.accel_note = Some(reason);
             return;
         }
         let result = match self.gpu_init_rx.as_ref().map(|rx| rx.try_recv()) {
@@ -867,6 +885,7 @@ impl EffectcraftApp {
             None => return,
         };
         self.gpu_init_rx = None;
+        self.gpu_init_started = None;
         let Some(rs) = self.gpu_init_render_state.take() else {
             self.session.accel_note = Some("GPU initialization finished without a presentation state; using CPU compositing.".into());
             return;
