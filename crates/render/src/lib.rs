@@ -1184,6 +1184,7 @@ impl<'a> Renderer<'a> {
             effect_index: 0,
             working_space: self.pipe.space,
             working_linear: self.pipe.linear,
+            float_depth: self.pipe.levels.is_none(),
             shutter: self.mb_on(ctx, layer).then_some((ctx.comp.shutter_angle, ctx.comp.shutter_phase, ctx.comp.motion_blur_samples)),
         };
         // Video effects in stack order (index, group, spec); disabled and audio effects skipped.

@@ -585,10 +585,13 @@ fn bc_modern(c: f32, br: f32, ct: f32, g: f32) -> f32 {
         return c;
     }
     var v = max(c, 0.0);
-    if (br > 0.0) {
-        v = 1.0 - powz(1.0 - v, exp2(1.24 * br));
-    } else if (br < 0.0) {
-        v = powz(v, exp2(-1.32 * br));
+    // After Effects inverts the positive brightness curve for negative settings.
+    var e = exp2(1.24 * abs(br));
+    if (br < 0.0) {
+        e = 1.0 / e;
+    }
+    if (br != 0.0) {
+        v = 1.0 - powz(1.0 - v, e);
     }
     if (ct != 0.0) {
         if (v < 0.5) {
@@ -608,7 +611,11 @@ fn levels_ch(c: f32, ib: f32, iw: f32, g: f32, ob: f32, ow: f32) -> f32 {
     if (P.u[0].z != 0u) {
         t = min(t, 1.0);
     }
-    t = powz(max(t, 0.0), 1.0 / g);
+    if (t >= 0.0) {
+        t = powz(t, 1.0 / g);
+    } else {
+        t = -powz(-t, 1.0 / g);
+    }
     return ob + (ow - ob) * t;
 }
 
@@ -617,8 +624,10 @@ fn exposure_ch(c: f32, gain: f32, offset: f32, gamma: f32, lin: bool) -> f32 {
         let x = c * gain + offset;
         return sign(x) * powz(abs(x), 1.0 / gamma);
     }
-    let x = srgb_to_linear(max(c, 0.0)) * gain + offset;
-    return sign(x) * linear_to_srgb(powz(abs(x), 1.0 / gamma));
+    // After Effects' Exposure effect uses a pure 2.2 power for its linear-light conversion.
+    let linear = sign(c) * powz(abs(c), 2.2);
+    let x = linear * gain + offset;
+    return sign(x) * powz(powz(abs(x), 1.0 / gamma), 1.0 / 2.2);
 }
 
 // u[0].x = op:
@@ -649,7 +658,9 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 1u: {
             if (a > 0.0) {
                 let c = straight(px);
-                let l = clamp(luminance(c), 0.0, 1.0);
+                // Rec. 601 weights, as After Effects: effects::LUMA_601 (checked by the test
+                // shader_constants_match_the_cpu).
+                let l = clamp(0.299 * c.x + 0.587 * c.y + 0.114 * c.z, 0.0, 1.0);
                 let blk = P.f[0].xyz;
                 let wht = P.f[1].xyz;
                 let t = blk + (wht - blk) * l;
@@ -666,7 +677,10 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
                     px = vec4<f32>(max((c + br - 0.5) * k + 0.5, vec3<f32>(0.0)) * a, a);
                 } else if (P.u[0].y == 2u) {
                     // Brightness & Contrast tone curves (effects crate bc_modern, AE-fitted #681).
-                    let g = max(1.0 + 0.53 * ct, 0.05);
+                    var g = max(1.0 + 0.53 * abs(ct), 0.05);
+                    if (ct < 0.0) {
+                        g = 1.0 / g;
+                    }
                     let o = vec3<f32>(bc_modern(c.x, br, ct, g), bc_modern(c.y, br, ct, g), bc_modern(c.z, br, ct, g));
                     px = vec4<f32>(o * a, a);
                 }
@@ -762,17 +776,13 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
             let c = P.f[0];
             let invert = P.u[0].y != 0u;
             let opacity = P.f[1].x;
+            // The fill colour at the layer's (or inverted) alpha times Opacity (color_fx::fill).
             var fa = px.w;
             if (invert) {
                 fa = 1.0 - px.w;
             }
-            let f = c.xyz * fa;
-            let rgb = px.xyz + (f - px.xyz) * opacity;
-            var alpha = px.w;
-            if (invert) {
-                alpha = px.w + (fa - px.w) * opacity;
-            }
-            px = vec4<f32>(rgb, alpha);
+            fa = fa * opacity;
+            px = vec4<f32>(c.xyz * fa, fa);
         }
         case 8u: {
             // effects::color2::map_ca: transparent pixels only change through the alpha curve.
