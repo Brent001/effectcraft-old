@@ -70,11 +70,11 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 pub use card3d::{CompLight, CompScene};
-pub use color_fx::{COLORAMA_PRESETS, ColoramaPalette};
 pub use color_fx::{
-    HUESAT_CHANNELS, HUESAT_RANGES, LEVELS_CHANNELS, PHOTO_FILTER_CUSTOM, PHOTO_FILTERS, exposure_settings, fill_uses_masks, huesat_ranges_identity,
-    levels_channel_ids, levels_channel_settings, levels_channels_identity, levels_clip,
+    BW_TINT_LUMA, EXPOSURE_LINEAR_GAMMA, HUESAT_CHANNELS, HUESAT_RANGES, LEVELS_CHANNELS, LUMA_601, PHOTO_FILTER_CUSTOM, PHOTO_FILTERS, exposure_settings,
+    fill_uses_masks, huesat_ranges_identity, levels_channel_ids, levels_channel_settings, levels_channels_identity, levels_clip,
 };
+pub use color_fx::{COLORAMA_PRESETS, ColoramaPalette};
 pub use color2::{Curve, auto_correct_settings, color_link_mode, color_link_sample, equalize_tables, luma_clip_points, shadow_highlight_amounts};
 pub use color3::OffsetCurve;
 pub use distort::transform_shutter;
@@ -91,7 +91,7 @@ pub use sim3::{PgBlit, PgPlan, playground_plan, playground_state};
 pub use stylize2::strobe_on;
 // CPU helpers the GPU kernels share (effectcraft-gpu).
 pub use blur2::{camera_lens_plain, camera_lens_spans};
-pub use generate::gen_mode;
+pub use generate::{four_color_softening, gen_mode};
 pub use generate2::pattern_kind as cell_pattern_kind;
 pub use generate2::{BoltSeg, Contour, Ghost, RadioPlan, Wave, flare_ghosts, lightning_segments, radio_plan};
 pub use generate3::{
@@ -406,6 +406,8 @@ pub struct EffectEnv<'a> {
     pub working_space: Option<effectcraft_color::ColorSpace>,
     /// Working-space pixels are linear light (Linearize Working Space).
     pub working_linear: bool,
+    /// The project works in 32 bpc float (Levels' "Off for 32 bpc Color" clips only below it).
+    pub float_depth: bool,
     /// The composition's shutter (angle and phase in degrees, samples per frame) when both the
     /// comp's and the layer's motion blur switches are on (Transform's Use Composition's
     /// Shutter Angle).
