@@ -38,11 +38,11 @@ on:
         type: string
         default: "5.0.2"
       nfpm-version:
-        description: "nfpm tool version"
+        description: "Version of nfpm to install"
         type: string
         default: "2.47.0"
       trunk-version:
-        description: "trunk tool version"
+        description: "Version of trunk to install"
         type: string
         default: "0.21.14"
       freebsd-release:
@@ -54,12 +54,11 @@ on:
         type: boolean
         default: false
 
-# App-specific copy of the shared release pipeline. EffectCraft intentionally ships no macOS
-# universal artifact; keep the remaining platform jobs and shared actions in sync when updating.
+# App-specific copy of the shared release pipeline, intentionally without macOS universal.
+# Keep the remaining platform jobs and shared actions synchronized with craft-common-actions.
 permissions:
   contents: read
 
-jobs:
 jobs:
   version:
     timeout-minutes: 10
@@ -76,7 +75,7 @@ jobs:
         uses: storytold/craft-common-actions/actions/resolve-version@main
         with:
           input-version: ${{ inputs.version }}
-          app-title: ${{ EffectCraft }}
+          app-title: EffectCraft
 
   windows:
     timeout-minutes: 90
@@ -541,18 +540,18 @@ jobs:
           if [ -f packaging/freebsd/package.sh ]; then
             bash packaging/freebsd/package.sh
           else
-            cargo build --release --locked -p ${{ effectcraft }} $(cargo metadata --format-version 1 --no-deps | grep -q '"${{ effectcraft }}-cli"' && echo "-p ${{ effectcraft }}-cli" || true)
-            name="${{ effectcraft }}-$VERSION-freebsd-${{ matrix.arch }}"
+            cargo build --release --locked -p effectcraft $(cargo metadata --format-version 1 --no-deps | grep -q '"effectcraft-cli"' && echo "-p effectcraft-cli" || true)
+            name="effectcraft-$VERSION-freebsd-${{ matrix.arch }}"
             mkdir -p "dist/release/$name"
-            cp target/release/${{ effectcraft }} "dist/release/$name/" 2>/dev/null || cp /var/tmp/craft-target/release/${{ effectcraft }} "dist/release/$name/"
-            if [ -f target/release/${{ effectcraft }}-cli ]; then
-              cp target/release/${{ effectcraft }}-cli "dist/release/$name/"
-            elif [ -f /var/tmp/craft-target/release/${{ effectcraft }}-cli ]; then
-              cp /var/tmp/craft-target/release/${{ effectcraft }}-cli "dist/release/$name/"
+            cp target/release/effectcraft "dist/release/$name/" 2>/dev/null || cp /var/tmp/craft-target/release/effectcraft "dist/release/$name/"
+            if [ -f target/release/effectcraft-cli ]; then
+              cp target/release/effectcraft-cli "dist/release/$name/"
+            elif [ -f /var/tmp/craft-target/release/effectcraft-cli ]; then
+              cp /var/tmp/craft-target/release/effectcraft-cli "dist/release/$name/"
             fi
             cp README.md LICENSE-MIT LICENSE-APACHE NOTICE ATTRIBUTION.md "dist/release/$name/" 2>/dev/null || true
-            if [ -f packaging/linux/ai.storyteller.${{ effectcraft }}.desktop ]; then
-              cp packaging/linux/ai.storyteller.${{ effectcraft }}.desktop "dist/release/$name/"
+            if [ -f packaging/linux/ai.storyteller.effectcraft.desktop ]; then
+              cp packaging/linux/ai.storyteller.effectcraft.desktop "dist/release/$name/"
             fi
             mkdir -p "dist/release/$name/icons"
             cp -R assets/app-icon/hicolor "dist/release/$name/icons/" 2>/dev/null || true
@@ -815,7 +814,7 @@ jobs:
       - name: Check the archive
         shell: bash
         run: |
-          tar -tzf "dist/release/${{ effectcraft }}-server-$VERSION-linux-${{ matrix.arch }}.tar.gz" || true
+          tar -tzf "dist/release/effectcraft-server-$VERSION-linux-${{ matrix.arch }}.tar.gz" || true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-server-linux-${{ matrix.arch }}
@@ -835,6 +834,6 @@ jobs:
       - uses: storytold/craft-common-actions/actions/draft-release@main
         with:
           version: ${{ needs.version.outputs.version }}
-          app-title: ${{ EffectCraft }}
+          app-title: EffectCraft
           prerelease: ${{ needs.version.outputs.prerelease }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
