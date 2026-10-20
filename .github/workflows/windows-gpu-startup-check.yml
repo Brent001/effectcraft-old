@@ -8,6 +8,8 @@ on:
       - "crates/gpu/**"
       - "crates/ui-egui/**"
       - "crates/export/**"
+      - "crates/render/**"
+      - "crates/effects/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/windows-gpu-startup-check.yml"
@@ -29,7 +31,17 @@ jobs:
         uses: actions/checkout@v4
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Check desktop, UI, GPU, and export crates
-        run: cargo check --locked -p effectcraft -p effectcraft-ui-egui -p effectcraft-gpu -p effectcraft-export
+      - name: Check desktop, UI, GPU, export, render, and effects crates
+        run: cargo check --locked -p effectcraft -p effectcraft-ui-egui -p effectcraft-gpu -p effectcraft-export -p effectcraft-render -p effectcraft-effects
       - name: Test export pipeline and frame scheduler
         run: cargo test --locked -p effectcraft-export
+      - name: Test concurrent render-cache sharing
+        run: cargo test --locked -p effectcraft-render workers_rendering_a_layer_at_once_share_one_buffer
+      - name: Test concurrent layer-style cache sharing
+        run: cargo test --locked -p effectcraft-render workers_styling_a_layer_at_once_share_its_buffers
+      - name: Test Cryptomatte CPU optimization
+        run: cargo test --locked -p effectcraft-effects crypto_aux_for_display_reads_colors_only_for_color_display
+      - name: Test Cryptomatte GPU parity
+        run: cargo test --locked -p effectcraft-gpu cryptomatte_every_display_matches_the_cpu
+      - name: Test lazy compositor pipeline setup
+        run: cargo test --locked -p effectcraft-gpu compositor_kernels_build_on_first_use
