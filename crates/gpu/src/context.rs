@@ -412,6 +412,8 @@ pub struct GpuContext {
     layout: wgpu::PipelineLayout,
     /// The compositor's own kernels (built up front: the compositor can't run without them).
     pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
+    /// Core or Classic 3D kernels the driver could not build (these paths fall back to the CPU).
+    unavailable: Vec<(&'static str, String)>,
     /// Effect kernels with their family (index in `FAMILIES`), built on first dispatch; `Err`
     /// says why one didn't build (its effects render on the CPU).
     effect_pipelines: HashMap<&'static str, (usize, std::sync::OnceLock<Result<wgpu::ComputePipeline, String>>)>,
