@@ -168,15 +168,21 @@ impl LayerCache {
                 // Disk cache: a hit comes back into memory.
                 let (dc, dk) = self.disk_key(key)?;
                 let buf = dc.get_layer(dk)?;
-                self.insert_mem(key, buf.clone());
-                Some(buf)
+                Some(self.insert_mem(key, buf))
             }
         }
     }
 
-    pub fn insert(&self, key: u64, buf: Arc<Buf>) {
+    /// Keep a buffer under a key, returning the buffer the cache holds for it. If concurrent
+    /// preview workers render the same layer, every worker reuses the first buffer instead of
+    /// duplicating the upload / atlas memory. Workers never wait for each other: a wait on the
+    /// shared render pool could deadlock under the work it waits for.
+    pub fn insert(&self, key: u64, buf: Arc<Buf>) -> Arc<Buf> {
         if self.gated() {
-            return;
+            return buf;
+        }
+        if let Some(kept) = self.inner.lock().ok().and_then(|g| g.map.get(&key).map(|e| e.buf.clone())) {
+            return kept;
         }
         let started = self.inner.lock().ok().and_then(|mut g| g.missed_at.remove(&key));
         if let Some((dc, dk)) = self.disk_key(key) {
@@ -185,20 +191,24 @@ impl LayerCache {
                 dc.put_layer(dk, &buf);
             }
         }
-        self.insert_mem(key, buf);
+        self.insert_mem(key, buf)
     }
 
-    fn insert_mem(&self, key: u64, buf: Arc<Buf>) {
+    /// Return the buffer retained for this key, which can be the provided buffer or one another
+    /// worker retained first. Buffers too large to cache are returned unchanged.
+    fn insert_mem(&self, key: u64, buf: Arc<Buf>) -> Arc<Buf> {
         let bytes = buf.img.data.len() * std::mem::size_of::<effectcraft_raster::Px>();
-        let Ok(mut g) = self.inner.lock() else { return };
+        let Ok(mut g) = self.inner.lock() else { return buf };
         if bytes > g.budget / 4 {
-            return;
+            return buf;
         }
         g.clock += 1;
         let now = g.clock;
-        if let Some(old) = g.map.insert(key, Entry { buf, bytes, last_use: now }) {
-            g.bytes -= old.bytes;
+        if let Some(e) = g.map.get_mut(&key) {
+            e.last_use = now;
+            return e.buf.clone();
         }
+        g.map.insert(key, Entry { buf: buf.clone(), bytes, last_use: now });
         g.bytes += bytes;
         if g.bytes > g.budget {
             // Evict least-recently used entries down to 3/4 of the budget.
@@ -214,6 +224,7 @@ impl LayerCache {
                 }
             }
         }
+        buf
     }
 
     /// The memory budget in bytes.
@@ -703,4 +714,24 @@ pub fn derive(key: u64, i: u64) -> u64 {
     let mut h = KeyHasher(key);
     i.hash(&mut h);
     h.finish()
+}
+
+
+#[cfg(test)]
+mod shared_insert_tests {
+    use std::sync::Arc;
+
+    use super::LayerCache;
+    use effectcraft_effects::Buf;
+    use effectcraft_raster::Image;
+
+    #[test]
+    fn the_buffer_kept_first_is_shared() {
+        let cache = LayerCache::default();
+        let buf = || Arc::new(Buf { img: Image::new(4, 4), offset: [0.0; 2], scale: 1.0 });
+        let (a, b) = (buf(), buf());
+        assert!(Arc::ptr_eq(&cache.insert(3, a.clone()), &a));
+        assert!(Arc::ptr_eq(&cache.insert(3, b), &a));
+        assert!(Arc::ptr_eq(&cache.get(3).unwrap(), &a));
+    }
 }
