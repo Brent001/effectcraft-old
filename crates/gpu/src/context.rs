@@ -1045,6 +1045,9 @@ impl GpuContext {
         let img = self.upload_image(&buf.img)?;
         if let Ok(mut u) = self.uploads.lock() {
             let bytes = buf.img.data.len() * 16;
+            // Another render worker may have advanced the clock while this upload was in flight.
+            // Allocate a unique, newest stamp when the entry is inserted.
+            u.clock += 1;
             let now = u.clock;
             if let Some(old) = u.map.remove(&key) {
                 u.order.remove(&(old.last_use, key));
