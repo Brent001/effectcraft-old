@@ -1,0 +1,80 @@
+name: Repair Cargo.lock (CI only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Branch or commit to repair (for example, main)"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: repair-cargo-lock-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  refresh-lockfile:
+    name: Regenerate lockfile and verify Windows build
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out requested revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust stable and Windows target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Regenerate Cargo.lock
+        shell: pwsh
+        run: cargo generate-lockfile
+
+      - name: Create repair branch and commit lockfile
+        id: commit
+        shell: pwsh
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          $branch = "ci/refresh-cargo-lockfile-$env:RUN_ID"
+          git switch -c $branch
+          if ($LASTEXITCODE -ne 0) { throw "Could not create repair branch" }
+          git add Cargo.lock
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            "changed=false" >> $env:GITHUB_OUTPUT
+            "branch=$branch" >> $env:GITHUB_OUTPUT
+            Write-Host "Cargo.lock did not change; no repair commit is needed."
+          } else {
+            git commit -m "ci: refresh Cargo.lock"
+            if ($LASTEXITCODE -ne 0) { throw "Could not commit regenerated Cargo.lock" }
+            git push origin "HEAD:refs/heads/$branch"
+            if ($LASTEXITCODE -ne 0) { throw "Could not push repair branch" }
+            "changed=true" >> $env:GITHUB_OUTPUT
+            "branch=$branch" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Verify Windows release dependencies with locked lockfile
+        shell: pwsh
+        run: cargo build --release --locked -p effectcraft -p effectcraft-cli --target x86_64-pc-windows-msvc
+
+      - name: Report repair branch
+        if: always()
+        shell: pwsh
+        env:
+          BRANCH: ${{ steps.commit.outputs.branch }}
+          CHANGED: ${{ steps.commit.outputs.changed }}
+        run: |
+          "Repair branch: $env:BRANCH" >> $env:GITHUB_STEP_SUMMARY
+          "Cargo.lock changed: $env:CHANGED" >> $env:GITHUB_STEP_SUMMARY
+          "Review and merge the repair branch only if the Windows build succeeds."
