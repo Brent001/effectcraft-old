@@ -1030,9 +1030,12 @@ impl GpuContext {
     /// Leave a kernel out, as if it had failed to build (tests of the CPU fallback).
     #[cfg(test)]
     pub(crate) fn drop_kernel(&mut self, entry: &'static str) {
-        self.pipelines.remove(entry);
-        self.ext_pipelines.remove(entry);
-        if let Some((family, _)) = self.effect_pipelines.get(entry) {
+        if let Some((family, _)) = self.pipelines.get(entry) {
+            let family = *family;
+            self.pipelines.insert(entry, (family, std::sync::OnceLock::from(Err("dropped by a test".into()))));
+        } else if self.ext_pipelines.contains_key(entry) {
+            self.ext_pipelines.insert(entry, std::sync::OnceLock::from(Err("dropped by a test".into())));
+        } else if let Some((family, _)) = self.effect_pipelines.get(entry) {
             let family = *family;
             self.effect_pipelines.insert(entry, (family, std::sync::OnceLock::from(Err("dropped by a test".into()))));
         } else {
