@@ -194,7 +194,7 @@ impl Gpu {
         let img = walk::render(&mut e, r, comp, t)?;
         // A lazy core kernel may fail on an older driver. Never publish a partially composited
         // frame: let the caller render the entire frame on the CPU instead.
-        if e.take_missing() {
+        if e.take_missing() || e.take_core_missing() {
             return None;
         }
         let texture = e.display(&img);
@@ -232,7 +232,7 @@ impl Gpu {
         }
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
-        if e.take_missing() {
+        if e.take_missing() || e.take_core_missing() {
             return None;
         }
         e.download(&img)
@@ -264,7 +264,7 @@ impl Gpu {
         let misses = d.misses();
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
-        if e.take_missing() {
+        if e.take_missing() || e.take_core_missing() {
             return None;
         }
         if d.misses() != misses {
@@ -364,7 +364,7 @@ impl Accelerator for Gpu {
         }
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
-        if e.take_missing() {
+        if e.take_missing() || e.take_core_missing() {
             return None;
         }
         let yp = self.ctx.yuv.get_or_init(|| yuv::YuvPipe::new(&self.ctx.device));
