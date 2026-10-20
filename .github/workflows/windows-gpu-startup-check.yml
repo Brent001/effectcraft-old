@@ -1,0 +1,32 @@
+name: Windows GPU startup repair
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/effectcraft/**"
+      - "crates/gpu/**"
+      - "crates/ui-egui/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/windows-gpu-startup-check.yml"
+  push:
+    branches: [fix/dx12-fxc-compositor-012]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-gpu-startup-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Check desktop and UI crates
+        run: cargo check --locked -p effectcraft -p effectcraft-ui-egui
