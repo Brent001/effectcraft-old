@@ -11,7 +11,7 @@ on:
       - "Cargo.lock"
       - ".github/workflows/windows-gpu-startup-check.yml"
   push:
-    branches: [fix/dx12-fxc-compositor-012]
+    branches: [main, fix/dx12-fxc-compositor-012]
 
 permissions:
   contents: read
