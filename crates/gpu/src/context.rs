@@ -988,13 +988,13 @@ impl GpuContext {
         None
     }
 
-    fn ext_pipeline(&self, entry: &str) -> Option<&wgpu::ComputePipeline> {
-        let cell = self.ext_pipelines.get(entry)?;
+    fn ext_pipeline(&self, requested: &str) -> Option<&wgpu::ComputePipeline> {
+        let (entry, cell) = self.ext_pipelines.get_key_value(requested)?;
         let built = cell.get_or_init(|| {
             let module = self.classic3d_module.get_or_init(|| {
                 kernel_module(&self.device, "effectcraft classic3d", &[include_str!("shaders/classic3d.wgsl")])
             });
-            module.as_ref().map_err(Clone::clone).and_then(|module| build_pipeline(&self.device, module, &self.layout_ext, entry))
+            module.as_ref().map_err(Clone::clone).and_then(|module| build_pipeline(&self.device, module, &self.layout_ext, *entry))
         });
         if let Err(why) = built {
             log::warn!("gpu {}: kernel {entry} unavailable, its 3D layers render on the CPU: {why}", self.name);
