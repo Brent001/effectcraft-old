@@ -192,6 +192,11 @@ impl Gpu {
         self.ctx.check_health().map_err(|e| log::error!("gpu display: {e}")).ok()?;
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
+        // A lazy core kernel may fail on an older driver. Never publish a partially composited
+        // frame: let the caller render the entire frame on the CPU instead.
+        if e.take_missing() {
+            return None;
+        }
         let texture = e.display(&img);
         e.submit();
         // Reject failures observed during rendering/submission before publishing the frame.
@@ -227,6 +232,9 @@ impl Gpu {
         }
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
+        if e.take_missing() {
+            return None;
+        }
         e.download(&img)
     }
 
@@ -256,6 +264,9 @@ impl Gpu {
         let misses = d.misses();
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
+        if e.take_missing() {
+            return None;
+        }
         if d.misses() != misses {
             // Layer steps are still in flight: this pass's canvas is not the frame.
             return Some(Image::new(1, 1));
@@ -353,6 +364,9 @@ impl Accelerator for Gpu {
         }
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
+        if e.take_missing() {
+            return None;
+        }
         let yp = self.ctx.yuv.get_or_init(|| yuv::YuvPipe::new(&self.ctx.device));
         let planes = yuv::convert(&mut e, yp, &img, bg)?;
         // A device fault seen while the frame recorded makes the planes untrustworthy.
