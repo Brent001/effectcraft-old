@@ -315,19 +315,24 @@ pub(crate) struct Params {
 }
 
 impl Params {
-    fn bytes(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(256);
+    /// Serialize the uniform block without allocating a heap buffer on every GPU dispatch.
+    /// Keep the existing little-endian field order and fixed 256-byte layout.
+    fn bytes(&self) -> [u8; 256] {
+        let mut bytes = [0u8; 256];
+        let mut offset = 0;
         for r in &self.u {
             for x in r {
-                v.extend_from_slice(&x.to_le_bytes());
+                bytes[offset..offset + 4].copy_from_slice(&x.to_le_bytes());
+                offset += 4;
             }
         }
         for r in &self.f {
             for x in r {
-                v.extend_from_slice(&x.to_le_bytes());
+                bytes[offset..offset + 4].copy_from_slice(&x.to_le_bytes());
+                offset += 4;
             }
         }
-        v
+        bytes
     }
 }
 
@@ -341,6 +346,9 @@ struct Upload {
 #[derive(Default)]
 struct Uploads {
     map: HashMap<usize, Upload>,
+    /// LRU index for the upload map. Keeping the oldest key ordered avoids rescanning every
+    /// cached texture for every eviction when large projects exceed the upload budget.
+    order: BTreeSet<(u64, usize)>,
     bytes: usize,
     clock: u64,
 }
@@ -1026,17 +1034,27 @@ impl GpuContext {
             if let Some(e) = u.map.get_mut(&key)
                 && e.buf.upgrade().is_some_and(|b| Arc::ptr_eq(&b, buf))
             {
+                let previous = e.last_use;
                 e.last_use = now;
-                return Some(e.img.clone());
+                let image = e.img.clone();
+                u.order.remove(&(previous, key));
+                u.order.insert((now, key));
+                return Some(image);
             }
         }
         let img = self.upload_image(&buf.img)?;
         if let Ok(mut u) = self.uploads.lock() {
             let bytes = buf.img.data.len() * 16;
+            // Another render worker may have advanced the clock while this upload was in flight.
+            // Allocate a unique, newest stamp when the entry is inserted.
+            u.clock += 1;
             let now = u.clock;
-            if let Some(old) = u.map.insert(key, Upload { buf: Arc::downgrade(buf), img: img.clone(), bytes, last_use: now }) {
+            if let Some(old) = u.map.remove(&key) {
+                u.order.remove(&(old.last_use, key));
                 u.bytes -= old.bytes;
             }
+            u.map.insert(key, Upload { buf: Arc::downgrade(buf), img: img.clone(), bytes, last_use: now });
+            u.order.insert((now, key));
             u.bytes += bytes;
             // Drop textures of freed buffers at once (a layer whose buffer changes every frame
             // makes a new one each time, and nothing can hit the old one again), then the least
@@ -1045,6 +1063,7 @@ impl GpuContext {
             let dead: Vec<usize> = u.map.iter().filter(|(_, e)| e.buf.strong_count() == 0).map(|(k, _)| *k).collect();
             for k in dead {
                 if let Some(e) = u.map.remove(&k) {
+                    u.order.remove(&(e.last_use, k));
                     u.bytes -= e.bytes;
                 }
             }
@@ -1056,8 +1075,9 @@ impl GpuContext {
                 );
             }
             while u.bytes > budget {
-                let Some(k) = u.map.iter().min_by_key(|(_, e)| e.last_use).map(|(k, _)| *k) else { break };
+                let Some((stamp, k)) = u.order.pop_first() else { break };
                 if let Some(e) = u.map.remove(&k) {
+                    debug_assert_eq!(e.last_use, stamp, "LRU index must match each cached upload");
                     u.bytes -= e.bytes;
                 }
             }
@@ -1069,6 +1089,7 @@ impl GpuContext {
     pub fn clear_uploads(&self) {
         if let Ok(mut u) = self.uploads.lock() {
             u.map.clear();
+            u.order.clear();
             u.bytes = 0;
         }
         if let Ok(mut p) = self.pool.lock() {
@@ -1484,6 +1505,37 @@ impl<'g> Enc<'g> {
 /// Mip levels of a full chain for a `w × h` texture (down to 1 × 1).
 pub(crate) fn mip_levels(w: u32, h: u32) -> u32 {
     u32::BITS - w.max(h).max(1).leading_zeros()
+}
+
+#[cfg(test)]
+mod params_bytes_tests {
+    use super::Params;
+
+    #[test]
+    fn serialization_is_the_same_256_byte_little_endian_layout() {
+        let mut p = Params::default();
+        p.u[0] = [0x0102_0304, 0xa0b0_c0d0, u32::MAX, 7];
+        p.u[3] = [19, 23, 29, 31];
+        p.f[0] = [1.0, -2.5, f32::INFINITY, f32::from_bits(0x7fc0_1234)];
+        p.f[11] = [0.25, -0.0, 1000.0, -9.75];
+
+        // Reference the former Vec-based serializer explicitly so layout, endianness, and
+        // float bit patterns are checked, including NaNs and signed zero.
+        let mut expected = Vec::with_capacity(256);
+        for r in &p.u {
+            for x in r {
+                expected.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        for r in &p.f {
+            for x in r {
+                expected.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        let actual = p.bytes();
+        assert_eq!(actual.len(), 256);
+        assert_eq!(actual.as_slice(), expected.as_slice());
+    }
 }
 
 #[cfg(test)]
