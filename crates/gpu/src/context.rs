@@ -440,6 +440,8 @@ pub struct GpuContext {
     /// Each of `FAMILIES`' modules, built with its first kernel; and their group 0 layout.
     modules: Vec<std::sync::OnceLock<Result<wgpu::ShaderModule, String>>>,
     layout: wgpu::PipelineLayout,
+    /// Extended layout for Classic 3D kernels using four auxiliary storage buffers.
+    layout_ext: wgpu::PipelineLayout,
     /// Core compositor and sky pipelines built at first dispatch, rather than at application start.
     pipelines: HashMap<&'static str, (usize, std::sync::OnceLock<Result<wgpu::ComputePipeline, String>>)>,
     /// Extended-layout kernels (currently Classic 3D), built at first use.
@@ -756,6 +758,7 @@ impl GpuContext {
             bgl_ext,
             modules,
             layout,
+            layout_ext,
             pipelines,
             ext_pipelines,
             classic3d_module: std::sync::OnceLock::new(),
