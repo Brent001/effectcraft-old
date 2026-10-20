@@ -2841,6 +2841,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             None if ks => t.keyframe_selected,
                             None => t.keyframe,
                         };
+                        // Muted keys stay visible and editable but no longer drive the value.
+                        let kcol = if k.muted { kcol.gamma_multiply(0.35) } else { kcol };
                         if k.roving {
                             // Roving keys: a small dot (their time follows their neighbours).
                             gp.circle_filled(c, 2.5, kcol);
@@ -2882,6 +2884,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             }
                         }
                         crate::widgets::context_menu(&kresp, |ui| {
+                            let mute_label = if k.muted { "Unmute Keyframes" } else { "Mute Keyframes" };
                             for (lbl, cmd, params) in [
                                 ("Edit Value…", "keys.set", json!({"layer": layer.id.0, "prop": uid, "time": k.time.seconds()})),
                                 ("-", "", json!({})),
@@ -2895,6 +2898,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                                 ("Keyframe Interpolation…", "keys.interpolation", json!({})),
                                 ("Keyframe Velocity…", "keys.velocity", json!({})),
                                 ("Toggle Hold Keyframe", "keys.toggleHold", json!({})),
+                                (mute_label, "keys.setMuted", json!({"muted": !k.muted})),
                                 ("Rove Across Time", "keys.interpolation", json!({"roving": !k.roving})),
                                 ("-", "", json!({})),
                                 ("Easy Ease", "keys.easyEase", json!({})),
