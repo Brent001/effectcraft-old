@@ -203,6 +203,7 @@ pub fn rect_radii(size: [f64; 2], pos: [f64; 2], radii: [f64; 4]) -> BezPath {
     p.line_to(Point::new(x0, y0 + tl));
     p.close_path();
     p
+}
 
 pub fn ellipse(size: [f64; 2], pos: [f64; 2]) -> BezPath {
     to_kurbo(&ShapePath::ellipse(pos, size[0], size[1]))
