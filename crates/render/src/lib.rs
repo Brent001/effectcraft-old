@@ -1599,7 +1599,7 @@ impl<'a> Renderer<'a> {
         }
         let mut body = Arc::new(st.body);
         let mut passes: Vec<_> = st.passes.into_iter().map(|(b, m)| (Arc::new(b), m)).collect();
-        if let (Some(c, Some(k)) = (self.cache_to_keep(), key) {
+        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
             body = c.insert(k, body);
             for (i, (b, _)) in passes.iter_mut().enumerate() {
                 *b = c.insert(cache::derive(k, i as u64 + 1), b.clone());
