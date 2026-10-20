@@ -54,7 +54,7 @@ on:
         type: boolean
         default: false
 
-# App-specific copy of the shared release pipeline, intentionally without macOS universal.
+# App-specific release pipeline, with macOS artifacts disabled for EffectCraft.
 # Keep the remaining platform jobs and shared actions synchronized with craft-common-actions.
 permissions:
   contents: read
@@ -141,7 +141,7 @@ jobs:
       FIGCRAFT_BUILD_SHA: ${{ github.sha }}
       INPUT_VERSION: ${{ inputs.version }}
     steps:
-      # See the macOS job: unlisted secrets are empty, and the build would ship unsigned.
+      # Unlisted signing secrets are empty, and the build would ship unsigned.
       # Signing needs either the PFX pair or all six Azure Trusted Signing values.
       - name: Require signing secrets on the release branch
         if: github.ref == 'refs/heads/release'
