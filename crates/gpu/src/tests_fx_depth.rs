@@ -252,6 +252,15 @@ fn ids_and_cryptomatte() {
 }
 
 #[test]
+fn cryptomatte_every_display_matches_the_cpu() {
+    for display in 0..3 {
+        for matte_only in [false, true] {
+            case("ec.3d.cryptomatte", &[("selection", Value::Str("beta, delta".into())), ("display", e(display)), ("matteOnly", Value::Bool(matte_only))]);
+        }
+    }
+}
+
+#[test]
 fn extractor() {
     case("ec.3d.extractor", &[("red", Value::Str("Z".into())), ("green", Value::Str("UV.U".into())), ("whitePoint", n(1000.0))]);
     case(
