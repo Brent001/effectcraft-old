@@ -42,7 +42,7 @@ const BASE_WGSL: [&str; 2] = [include_str!("shaders/common.wgsl"), include_str!(
 /// files it borrows functions from, built the first time one of its kernels is. A pipeline then
 /// compiles at most ~120K characters of WGSL instead of all ~460K: on WebGPU each pipeline
 /// compiles its module again, and the page's and its workers' devices doing that for every
-/// kernel kept Chrome's GPU process busy past its watchdog (#1590). Family 0 is the base module.
+/// kernel kept Chrome's GPU process busy past its watchdog (#1590). Family 1 is the core kernels module.
 // Keep sky kernels in their own module and compile them only when Advanced 3D first uses one.
 const SKY_FAMILY: usize = 0;
 const KERNELS_FAMILY: usize = 1;
