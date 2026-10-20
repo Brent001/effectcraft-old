@@ -43,7 +43,11 @@ const BASE_WGSL: [&str; 2] = [include_str!("shaders/common.wgsl"), include_str!(
 /// compiles at most ~120K characters of WGSL instead of all ~460K: on WebGPU each pipeline
 /// compiles its module again, and the page's and its workers' devices doing that for every
 /// kernel kept Chrome's GPU process busy past its watchdog (#1590). Family 0 is the base module.
+// Keep sky kernels in their own module and compile them only when Advanced 3D first uses one.
+const SKY_FAMILY: usize = 0;
+const KERNELS_FAMILY: usize = 1;
 const FAMILIES: &[(&str, &[&str], &[&str])] = &[
+    ("sky", &[include_str!("shaders/sky.wgsl")], crate::adv3d::SKY_KERNELS),
     ("kernels", &[], EFFECT_ENTRIES),
     ("fx_color", &[include_str!("shaders/fx_lut.wgsl"), include_str!("shaders/fx_color.wgsl")], crate::fx_color::KERNELS),
     ("fx_distort", &[include_str!("shaders/fx_distort.wgsl")], crate::fx_distort::KERNELS),
@@ -422,8 +426,11 @@ pub struct GpuContext {
     /// Each of `FAMILIES`' modules, built with its first kernel; and their group 0 layout.
     modules: Vec<std::sync::OnceLock<Result<wgpu::ShaderModule, String>>>,
     layout: wgpu::PipelineLayout,
-    /// The compositor's own kernels (built up front: the compositor can't run without them).
-    pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
+    /// Core compositor and sky pipelines built at first dispatch, rather than at application start.
+    pipelines: HashMap<&'static str, (usize, std::sync::OnceLock<Result<wgpu::ComputePipeline, String>>)>,
+    /// Extended-layout kernels (currently Classic 3D), built at first use.
+    ext_pipelines: HashMap<&'static str, std::sync::OnceLock<Result<wgpu::ComputePipeline, String>>>,
+    classic3d_module: std::sync::OnceLock<Result<wgpu::ShaderModule, String>>,
     /// Core or Classic 3D kernels rejected by the driver; these paths fall back to the CPU.
     unavailable: Vec<(&'static str, String)>,
     /// Effect kernels with their family (index in `FAMILIES`), built on first dispatch; `Err`
@@ -608,7 +615,6 @@ impl GpuContext {
         if let Some(why) = &adv3d_unsupported {
             log::info!("gpu {name}: Advanced 3D renders on the CPU ({why})");
         }
-        let module = kernel_module(&device, "effectcraft kernels", &[])?;
         let bgl = init_resource(&device, "kernels bind-group layout", || {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("effectcraft kernels"),
@@ -661,33 +667,21 @@ impl GpuContext {
                 immediate_size: 0,
             })
         })?;
-        let sky = kernel_module(&device, "effectcraft sky", &[include_str!("shaders/sky.wgsl")])?;
-        let classic3d = kernel_module(&device, "effectcraft classic3d", &[include_str!("shaders/classic3d.wgsl")])?;
-        let mut pipelines = ENTRIES
+        // Register pipelines without compiling them. Older Intel DX12/FXC drivers can spend
+        // a long time creating even kernels that a given project never uses.
+        let mut pipelines: HashMap<_, _> = ENTRIES
             .iter()
-            .map(|e| Ok((*e, build_pipeline(&device, &module, &layout, e)?)))
-            .collect::<Result<HashMap<_, _>, String>>()?;
+            .map(|e| (*e, (KERNELS_FAMILY, std::sync::OnceLock::new())))
+            .collect();
         for e in crate::adv3d::SKY_KERNELS.iter().copied() {
-            pipelines.insert(e, build_pipeline(&device, &sky, &layout, e)?);
+            pipelines.insert(e, (SKY_FAMILY, std::sync::OnceLock::new()));
         }
-        // Classic 3D stays optional: older Intel/FXC drivers can reject its component writes.
-        let mut unavailable = vec![];
-        for e in EXT_ENTRIES {
-            match build_pipeline(&device, &classic3d, &layout_ext, e) {
-                Ok(p) => { pipelines.insert(*e, p); }
-                Err(why) => {
-                    log::warn!("gpu {name}: kernel {e} unavailable, its 3D layers render on the CPU: {why}");
-                    unavailable.push((*e, why));
-                }
-            }
-        }
+        let ext_pipelines = EXT_ENTRIES.iter().map(|e| (*e, std::sync::OnceLock::new())).collect();
         let effect_pipelines =
-            FAMILIES.iter().enumerate().flat_map(|(family, (_, _, kernels))| {
+            FAMILIES.iter().enumerate().skip(1).flat_map(|(family, (_, _, kernels))| {
                 kernels.iter().map(move |e| (*e, (family, std::sync::OnceLock::new())))
             }).collect();
-        let modules = std::iter::once(std::sync::OnceLock::from(Ok(module)))
-            .chain(FAMILIES.iter().skip(1).map(|_| std::sync::OnceLock::new()))
-            .collect();
+        let modules = FAMILIES.iter().map(|_| std::sync::OnceLock::new()).collect();
         let dmodule = init_resource(&device, "display shader module", || {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("effectcraft display"),
@@ -747,7 +741,9 @@ impl GpuContext {
             modules,
             layout,
             pipelines,
-            unavailable,
+            ext_pipelines,
+            classic3d_module: std::sync::OnceLock::new(),
+            unavailable: vec![],
             effect_pipelines,
             display_bgl,
             display,
@@ -938,15 +934,29 @@ impl GpuContext {
         pollster::block_on(GpuContext::request()).map_err(|e| log::info!("gpu: {e}")).ok()
     }
 
-    /// Whether a kernel is available (Classic 3D and effect kernels may fall back to the CPU).
+    /// Whether a kernel may run on this adapter. Unbuilt pipelines remain eligible; a pipeline
+    /// that failed compilation is marked unavailable and that operation falls back to the CPU.
     pub(crate) fn has_kernel(&self, entry: &str) -> bool {
-        self.pipelines.contains_key(entry)
-            || self.effect_pipelines.get(entry).is_some_and(|(_, cell)| !matches!(cell.get(), Some(Err(_))))
+        if let Some((_, cell)) = self.pipelines.get(entry) {
+            return !matches!(cell.get(), Some(Err(_)));
+        }
+        if let Some(cell) = self.ext_pipelines.get(entry) {
+            return !matches!(cell.get(), Some(Err(_)));
+        }
+        self.effect_pipelines.get(entry).is_some_and(|(_, cell)| !matches!(cell.get(), Some(Err(_))))
     }
 
-    /// Effect kernels unavailable so far; unused lazy kernels are not listed.
+    /// Kernels that failed after first use; unused lazy kernels are not listed.
     pub fn unavailable_kernels(&self) -> Vec<(&'static str, String)> {
         let mut out = self.unavailable.clone();
+        out.extend(self.pipelines.iter().filter_map(|(entry, (_, cell))| match cell.get() {
+            Some(Err(why)) => Some((*entry, why.clone())),
+            _ => None,
+        }));
+        out.extend(self.ext_pipelines.iter().filter_map(|(entry, cell)| match cell.get() {
+            Some(Err(why)) => Some((*entry, why.clone())),
+            _ => None,
+        }));
         out.extend(self.effect_pipelines.iter().filter_map(|(entry, (_, cell))| match cell.get() {
             Some(Err(why)) => Some((*entry, why.clone())),
             _ => None,
@@ -955,20 +965,40 @@ impl GpuContext {
         out
     }
 
-    /// Get a compositor or effect pipeline, compiling effect kernels on first use.
+    /// Get a compositor or effect pipeline, compiling its module and pipeline on first use.
     fn pipeline(&self, entry: &str) -> Option<&wgpu::ComputePipeline> {
-        if let Some(p) = self.pipelines.get(entry) { return Some(p); }
-        let Some((e, (family, cell))) = self.effect_pipelines.get_key_value(entry) else {
-            log::error!("gpu: no kernel {entry}");
-            return None;
-        };
-        let built = cell.get_or_init(|| {
-            let built = self.family_module(*family).and_then(|module| build_pipeline(&self.device, module, &self.layout, *e));
-            if let Err(why) = &built {
+        if let Some((e, (family, cell))) = self.pipelines.get_key_value(entry) {
+            let built = cell.get_or_init(|| self.family_module(*family).and_then(|module| build_pipeline(&self.device, module, &self.layout, *e)));
+            if let Err(why) = built {
+                log::warn!("gpu {}: kernel {e} unavailable, affected operations render on the CPU: {why}", self.name);
+            }
+            return built.as_ref().ok();
+        }
+        if let Some((e, (family, cell))) = self.effect_pipelines.get_key_value(entry) {
+            let built = cell.get_or_init(|| self.family_module(*family).and_then(|module| build_pipeline(&self.device, module, &self.layout, *e)));
+            if let Err(why) = built {
                 log::warn!("gpu {}: kernel {e} unavailable, its effects render on the CPU: {why}", self.name);
             }
-            built
+            return built.as_ref().ok();
+        }
+        if self.ext_pipelines.contains_key(entry) {
+            return self.ext_pipeline(entry);
+        }
+        log::error!("gpu: no kernel {entry}");
+        None
+    }
+
+    fn ext_pipeline(&self, entry: &str) -> Option<&wgpu::ComputePipeline> {
+        let cell = self.ext_pipelines.get(entry)?;
+        let built = cell.get_or_init(|| {
+            let module = self.classic3d_module.get_or_init(|| {
+                kernel_module(&self.device, "effectcraft classic3d", &[include_str!("shaders/classic3d.wgsl")])
+            });
+            module.as_ref().map_err(Clone::clone).and_then(|module| build_pipeline(&self.device, module, &self.layout_ext, entry))
         });
+        if let Err(why) = built {
+            log::warn!("gpu {}: kernel {entry} unavailable, its 3D layers render on the CPU: {why}", self.name);
+        }
         built.as_ref().ok()
     }
 
@@ -980,8 +1010,10 @@ impl GpuContext {
         cell.get_or_init(|| kernel_module(&self.device, label, files)).as_ref().map_err(Clone::clone)
     }
 
-    /// Build all lazy effect kernels, used by validation tests and hosts wanting up-front compilation.
+    /// Build every lazy kernel, used by validation tests and hosts wanting up-front compilation.
     pub fn build_all_kernels(&self) {
+        for entry in self.pipelines.keys() { let _ = self.pipeline(entry); }
+        for entry in self.ext_pipelines.keys() { let _ = self.ext_pipeline(entry); }
         for entry in self.effect_pipelines.keys() { let _ = self.pipeline(entry); }
     }
 
@@ -990,10 +1022,16 @@ impl GpuContext {
         self.effect_pipelines.values().filter(|(_, cell)| matches!(cell.get(), Some(Ok(_)))).count()
     }
 
+    #[cfg(test)]
+    pub(crate) fn core_pipelines_built(&self) -> usize {
+        self.pipelines.values().filter(|(_, cell)| matches!(cell.get(), Some(Ok(_)))).count()
+    }
+
     /// Leave a kernel out, as if it had failed to build (tests of the CPU fallback).
     #[cfg(test)]
     pub(crate) fn drop_kernel(&mut self, entry: &'static str) {
         self.pipelines.remove(entry);
+        self.ext_pipelines.remove(entry);
         if let Some((family, _)) = self.effect_pipelines.get(entry) {
             let family = *family;
             self.effect_pipelines.insert(entry, (family, std::sync::OnceLock::from(Err("dropped by a test".into()))));
@@ -1330,7 +1368,7 @@ impl<'g> Enc<'g> {
         ext: Option<[&wgpu::Buffer; 4]>,
     ) {
         let g = self.g;
-        let Some(pipe) = g.pipeline(entry) else {
+        let Some(pipe) = if ext.is_some() { g.ext_pipeline(entry) } else { g.pipeline(entry) } else {
             self.missing = true;
             return;
         };
