@@ -314,26 +314,7 @@ impl EffectHost for FxHost<'_, '_, '_> {
     }
 
     fn aux(&self) -> Option<Arc<effectcraft_raster::AuxChannels>> {
-        match &self.layer.source {
-            LayerSource::Footage { item } => {
-                let ItemKind::Footage(f) = &self.r.project.item(*item)?.kind else { return None };
-                let a = self.r.footage.aux(*item, f, self.ctx.source_time(self.layer))?;
-                // Aux pixels per layer pixel (the layer is the footage at its nominal size).
-                if f.width > 0 && a.width > 0 {
-                    let mut a = (*a).clone();
-                    a.scale = a.width as f64 / f.width as f64;
-                    return Some(Arc::new(a));
-                }
-                Some(a)
-            }
-            LayerSource::Comp { item } => {
-                if self.r.depth > MAX_FX_DEPTH || self.r.project.comp_contains(*item, self.ctx.comp_id) {
-                    return None;
-                }
-                self.r.nested().comp_aux(*item, self.ctx.nested_time(self.layer)).map(Arc::new)
-            }
-            _ => None,
-        }
+        self.r.layer_aux(self.ctx, self.layer)
     }
 
     fn params_at(&self, layer_time: f64) -> Option<Params> {
@@ -2102,6 +2083,34 @@ impl<'a> Renderer<'a> {
     pub fn comp_aux(&self, comp_id: ItemId, t: Tick) -> Option<effectcraft_raster::AuxChannels> {
         let ctx = self.eval_ctx(comp_id, t)?;
         Some(three_d::compose::aux_pass(self, &ctx))
+    }
+
+    /// The auxiliary channels effects on `layer` read ([`EffectHost::aux`]): its multi-layer
+    /// OpenEXR footage's at the layer's source time (Time Remap included), or a precomp's
+    /// generated 3D channels at its nested time. `None` for other layers.
+    pub fn layer_aux(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<effectcraft_raster::AuxChannels>> {
+        match &layer.source {
+            LayerSource::Footage { item } => {
+                let ItemKind::Footage(f) = &self.project.item(*item)?.kind else { return None };
+                let a = self.footage.aux(*item, f, ctx.source_time(layer))?;
+                // Aux pixels per layer pixel (the layer is the footage at its nominal size). The
+                // planes are only copied when that changes the scale.
+                let scale = a.width as f64 / f.width as f64;
+                if f.width > 0 && a.width > 0 && a.scale != scale {
+                    let mut a = (*a).clone();
+                    a.scale = scale;
+                    return Some(Arc::new(a));
+                }
+                Some(a)
+            }
+            LayerSource::Comp { item } => {
+                if self.depth > MAX_FX_DEPTH || self.project.comp_contains(*item, ctx.comp_id) {
+                    return None;
+                }
+                self.nested().comp_aux(*item, ctx.nested_time(layer)).map(Arc::new)
+            }
+            _ => None,
+        }
     }
 
     /// Evaluation context of comp `comp_id` at comp time `t`.
