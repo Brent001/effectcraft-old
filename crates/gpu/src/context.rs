@@ -1192,12 +1192,6 @@ impl GpuContext {
         atlases.push(Atlas { bufs: bufs.iter().map(Arc::downgrade).collect(), img, pos, last_use });
     }
 
-    /// Number of cached Classic 3D atlases (tests).
-    #[cfg(test)]
-    pub(crate) fn atlas_entries(&self) -> usize {
-        self.atlases.lock().map(|atlases| atlases.len()).unwrap_or_default()
-    }
-
     /// Forget uploaded layer textures.
     pub fn clear_uploads(&self) {
         if let Ok(mut u) = self.uploads.lock() {
