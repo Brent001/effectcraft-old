@@ -11,6 +11,7 @@ After Effects', and does the preset library exist. The per-effect catalogue is t
 
 | Question | Value | Kind |
 |---|---|---|
+| 2026-10-19 | minor | Timewarp ignores the effects above it (source and masks only), measured against After Effects 2026 |
 | Effects present | **306** registered, 3,017 parameters; all of After Effects' effects by name (298 at the M9.11 count) plus Obsolete and our own | Measured: registry, [effects.md](effects.md). After Effects 26.5's `Plug-ins/Effects` holds 306 `.plugin` bundles in 231 entries (one bundle can hold several effects, so this is a cross-check, not a match) |
 | Parameter names, order, popups, units, defaults | aligned in M9.12 | Agent-checked against After Effects' documentation, not against a live dump |
 | On the GPU | **280** (92%) | Measured: registry flags; GPU vs CPU agreement tested per effect |
@@ -44,7 +45,7 @@ corpus compares renders, each effect is assumed to differ somewhere, and users k
 | Simulation | 18 | 18 | Particle Playground lacks Particle Exploder, text particles, ephemeral mapper; CC Particle World camera fixed (#397) |
 | Stylize | 25 | 25 | Motion Tile output size (#369) |
 | Text | 2 | 2 | — |
-| Time | 8 | 8 | #535 (Pixel Motion Blur, Vector Detail) is closed |
+| Time | 8 | 8 | Timewarp retimes the layer's source and masks without the effects above it, as After Effects 2026; #535 (Pixel Motion Blur, Vector Detail) is closed |
 | Transition | 17 | 17 | — |
 | Utility | 9 | 7 | — |
 
