@@ -91,9 +91,12 @@ pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
 /// Uploaded layer buffers kept on the GPU by default (bytes; [`GpuContext::set_upload_budget`]).
 const UPLOAD_BUDGET: usize = 1536 << 20;
+/// Smaller caches for integrated/software adapters share RAM with the app and operating system.
+const INTEGRATED_UPLOAD_BUDGET: usize = 128 << 20;
 
 /// Working textures kept for reuse once their last image is dropped (bytes).
 const POOL_BUDGET: usize = 768 << 20;
+const INTEGRATED_POOL_BUDGET: usize = 96 << 20;
 
 /// Readback staging buffers kept for reuse across sizes (bytes).
 const STAGING_BUDGET: u64 = 256 << 20;
@@ -161,7 +164,6 @@ impl Drop for Lease {
 /// submitted yet. Reusing it in another encoder that is submitted first would overwrite it
 /// before those reads run, so a released texture waits until every encoder that was open when
 /// it was released has been submitted (or dropped).
-#[derive(Default)]
 pub(crate) struct Pool {
     free: HashMap<(u32, u32), Vec<wgpu::Texture>>,
     /// (texture, newest encoder open at its release).
@@ -170,6 +172,8 @@ pub(crate) struct Pool {
     open: BTreeSet<u64>,
     next: u64,
     bytes: usize,
+    /// Maximum bytes of free working textures retained for reuse.
+    budget: usize,
     /// Working textures reused / newly allocated (diagnostics, tests).
     hits: u64,
     misses: u64,
@@ -183,6 +187,32 @@ pub(crate) struct Pool {
     #[cfg(test)]
     escaped_parked: u64,
 }
+
+impl Default for Pool {
+    fn default() -> Self {
+        Self {
+            free: HashMap::new(),
+            released: Vec::new(),
+            open: BTreeSet::new(),
+            next: 0,
+            bytes: 0,
+            budget: POOL_BUDGET,
+            hits: 0,
+            misses: 0,
+            owned: HashMap::new(),
+            next_owner: 0,
+            #[cfg(test)]
+            escaped_parked: 0,
+        }
+    }
+}
+
+impl Pool {
+    fn with_budget(budget: usize) -> Self {
+        Self { budget, ..Self::default() }
+    }
+}
+
 
 /// In-`Enc` texture reuse ([`Pool::owned`]); tests turn it off to compare.
 pub(crate) static TEXTURE_REUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -296,7 +326,7 @@ impl Pool {
 
     fn make_free(&mut self, t: wgpu::Texture) {
         let b = tex_bytes(&t);
-        if self.bytes + b > POOL_BUDGET {
+        if self.bytes.saturating_add(b) > self.budget {
             return;
         }
         self.bytes += b;
@@ -599,6 +629,13 @@ impl GpuContext {
     /// [`Self::device_failure_notifier`] for immediate readback cancellation.
     pub fn new(adapter: &wgpu::Adapter, device: wgpu::Device, queue: wgpu::Queue) -> Result<GpuContext, String> {
         let info = adapter.get_info();
+        let adapter_name = info.name.to_ascii_lowercase();
+        let constrained_memory = matches!(info.device_type, wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Cpu)
+            || (adapter_name.contains("intel")
+                && (adapter_name.contains("hd graphics") || adapter_name.contains("uhd graphics") || adapter_name.contains("iris")));
+        if constrained_memory {
+            log::info!("gpu {}: using reduced working-cache budgets for shared-memory rendering", info.name);
+        }
         if !adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS) {
             return Err(format!("{} ({:?}): no compute shaders", info.name, info.backend));
         }
@@ -773,9 +810,9 @@ impl GpuContext {
             uploads: Mutex::new(Uploads::default()),
             handoff: AtomicBool::new(true),
             atlases: Mutex::default(),
-            upload_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
+            upload_budget: std::sync::atomic::AtomicUsize::new(if constrained_memory { INTEGRATED_UPLOAD_BUDGET } else { UPLOAD_BUDGET }),
             upload_full_warned: Default::default(),
-            pool: Default::default(),
+            pool: Arc::new(Mutex::new(Pool::with_budget(if constrained_memory { INTEGRATED_POOL_BUDGET } else { POOL_BUDGET }))),
             staging: Default::default(),
             transfers: Default::default(),
             zeros: Default::default(),
