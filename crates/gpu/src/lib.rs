@@ -385,6 +385,7 @@ impl Accelerator for Gpu {
     }
 
     fn effects(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<Buf> {
+        self.ctx.check_health().ok()?;
         effects::run_chain(&mut Enc::new(&self.ctx), chain, buf, levels)
     }
 
@@ -396,7 +397,7 @@ impl Accelerator for Gpu {
     }
 
     fn adopt(&self, buf: &Arc<Buf>, hold: effectcraft_render::ChainHold) {
-        if let Some(img) = hold.into_inner::<context::GpuImage>() {
+        if let Some(img) = hold.into_inner::<GpuImage>() {
             self.ctx.adopt_upload(buf, img);
         }
     }
