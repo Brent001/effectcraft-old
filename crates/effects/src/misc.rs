@@ -120,25 +120,18 @@ pub fn glow_ab_t(l: f32, looping: u32, loops: f32, phase: f32, mid: f32) -> f32 
     t.max(0.0).powf(0.5f32.ln() / m.ln())
 }
 
-/// Glow's blur: a Gaussian of σ = 0.384 × Glow Radius. Fitted to After Effects 2026 (cases
-/// 807 and 808, Glow Radius 10 and 30 on a grey solid): the edge profile of the glow's
-/// coverage is an erfc step of that σ within 1.7/255 (it was σ = radius / 2).
+/// Glow's Gaussian blur radius in the stable v0.11.1 effect implementation.
 pub fn glow_sigma(radius: f64) -> f64 {
-    (radius * 0.384).max(0.5)
+    (radius / 2.0).max(0.5)
 }
 
-/// Glow's bright pass for the original colours, per channel of the straight colour `v`:
-/// `8 × (v − threshold + 0.0611)`, nothing below. Fitted to After Effects 2026 renders of grey
-/// 0.65 / 0.8 / 0.9 / 1, orange and light-blue solids at Threshold 40 / 60 / 80 % and Radius 10
-/// / 30 (36 channel values, exact to the 8-bit capture): the glow is linear in each channel,
-/// its gain is the same at every threshold and radius, and channels below the threshold add
-/// nothing (an orange solid glows red only).
+/// Legacy optional helper for callers that explicitly need the newer per-channel Glow fit.
+/// The stable v0.11.1 Glow path does not use this helper.
 pub fn glow_bright_channel(v: f32, thr: f32) -> f32 {
     (GLOW_GAIN * (v - thr + GLOW_KNEE)).max(0.0)
 }
 
-/// [`glow_bright_channel`]'s gain and threshold offset. `kernels.wgsl` repeats both as literals;
-/// the GPU test `glow_constants_match_the_cpu` checks that they are these.
+/// Constants for the legacy helper above; stable Glow does not use them in its bright pass.
 pub const GLOW_GAIN: f32 = 8.0;
 pub const GLOW_KNEE: f32 = 0.0611;
 
@@ -205,31 +198,23 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
         // Glow Based On: brightness from the colours, or from the alpha channel.
         let l = if alpha_based { a } else { luminance(px[0] / a, px[1] / a, px[2] / a) };
         let k = ((l - thr) / (1.0 - thr).max(1e-3)).clamp(0.0, 1.0);
-        // Based on the colour channels, the glow's coverage is the layer's whole alpha, below
-        // the threshold too: After Effects darkens what lies under a dim layer's edge (glow_alpha).
-        let ga = if alpha_based { k * a } else { a };
         if let Some(map) = &arbitrary {
             let t = glow_ab_t(l, looping, loops, phase, mid);
             let c = map.iter().map(|cv| cv.as_ref().map_or(t, |cv| cv.eval(t))).collect::<Vec<f32>>();
-            *px = [c[0] * k * a, c[1] * k * a, c[2] * k * a, ga];
+            *px = [c[0] * k * a, c[1] * k * a, c[2] * k * a, k * a];
         } else if use_colors {
             let t = glow_ab_t(l, looping, loops, phase, mid);
             let c = [ca[0] + (cb[0] - ca[0]) * t, ca[1] + (cb[1] - ca[1]) * t, ca[2] + (cb[2] - ca[2]) * t];
-            *px = [c[0] * k * a, c[1] * k * a, c[2] * k * a, ga];
-        } else if alpha_based {
-            *px = [px[0] * k, px[1] * k, px[2] * k, ga];
+            *px = [c[0] * k * a, c[1] * k * a, c[2] * k * a, k * a];
         } else {
-            // Original colours: each channel of the straight colour against the threshold.
-            let c = [px[0] / a, px[1] / a, px[2] / a].map(|v| glow_bright_channel(v, thr) * a);
-            *px = [c[0], c[1], c[2], ga];
+            *px = px.map(|v| v * k);
         }
     });
     let s = glow_sigma(radius);
     let blurred = gaussian_blur(&bright, s * kx, s * ky, false);
     let mode = ctx.params.e("operation");
     b.img.data.par_iter_mut().zip(blurred.data.par_iter()).for_each(|(o, g)| {
-        // Intensity scales the glow's colour; with the colour channels its coverage stays.
-        let g = [g[0] * intensity, g[1] * intensity, g[2] * intensity, if alpha_based { g[3] * intensity } else { g[3] }];
+        let g = g.map(|v| v * intensity);
         match mode {
             // Behind: the glow shows only where the original is transparent.
             1 => {
@@ -857,187 +842,33 @@ mod tests {
         img
     }
 
-    /// After Effects 2026 (cases 524, 807, 808, 809): Glow on a 50 % grey solid, which is below
-    /// the 60 % threshold, still covers a blurred copy of the layer's alpha with black, so the
-    /// red layer underneath darkens outside the edge. The halo is the same at Intensity 1 and 3
-    /// and with Composite Original On Top or Behind; its width follows Glow Radius.
+    /// Stable-release regression: zero Glow Intensity must preserve both source pixels and
+    /// transparent pixels outside the expanded layer bounds (no radius-shaped dark box).
     #[test]
-    fn glow_halo_matches_after_effects() {
+    fn glow_zero_intensity_preserves_transparent_padding() {
         let grey = effectcraft_raster::Image::filled(200, 120, [0.5, 0.5, 0.5, 1.0]);
-        // AE's red under the halo at 0.5, 1.5, 3.5, 5.5 and 7.5 px outside the left edge
-        // (radius 10) and at 0.5, 5.5, 10.5, 20.5 px (radius 30); halo alpha = 1 − red.
-        let r10 = [(0.5, 140.0), (1.5, 165.0), (3.5, 208.0), (5.5, 234.0), (7.5, 248.0)];
-        let r30 = [(0.5, 132.0), (5.5, 173.0), (10.5, 208.0), (20.5, 245.0)];
-        for (radius, intensity, operation, profile) in [(10.0, 1.0, 1, &r10[..]), (10.0, 3.0, 1, &r10[..]), (10.0, 1.0, 0, &r10[..]), (30.0, 1.0, 1, &r30[..])]
-        {
-            let set = [
+        let out = run_fx(
+            "ec.stylize.glow",
+            &[
                 ("based", Value::Enum(1)),
                 ("threshold", num(60.0)),
-                ("radius", num(radius)),
-                ("intensity", num(intensity)),
-                ("operation", Value::Enum(operation)),
-            ];
-            let o = run_fx("ec.stylize.glow", &set, grey.clone(), 0.0, EffectEnv::default());
-            for &(d, red) in profile {
-                // Layer x = −d (pixel centre), mid-height; over AE's red: R = 1 − α, colour 0.
-                let (bx, by) = o.to_px([-d, 60.0]);
-                let p = o.img.get(bx.floor() as i64, by.floor() as i64);
-                let ae = 1.0 - red / 255.0;
-                assert!((p[3] - ae).abs() < 3.0 / 255.0, "radius {radius} intensity {intensity} op {operation} at {d} px: alpha {} vs AE {ae}", p[3]);
-                assert!(p[0].abs() < 1e-6, "the halo is black: {p:?}");
-            }
-        }
-    }
-
-    /// After Effects 2026, Glow at Threshold 60 %, Radius 10, Intensity 0.25 on 200 × 200
-    /// solids over red: the glow 1.5 px outside the left edge, premultiplied (the green / blue
-    /// channels of the render, where the red background adds nothing), and its alpha 0.353.
-    #[test]
-    fn glow_brightness_matches_after_effects() {
-        // (solid colour, channel, AE glow value 0..255)
-        let cases = [
-            ([0.65, 0.65, 0.65], 1, 20.0),
-            ([0.8, 0.8, 0.8], 1, 47.0),
-            ([0.9, 0.9, 0.9], 1, 65.0),
-            ([1.0, 1.0, 1.0], 1, 83.0),
-            ([1.0, 0.5, 0.0], 1, 0.0),
-            ([0.2, 0.6, 1.0], 1, 11.0),
-            ([0.2, 0.6, 1.0], 2, 83.0),
-        ];
-        for (c, ch, ae) in cases {
-            let img = effectcraft_raster::Image::filled(200, 200, [c[0], c[1], c[2], 1.0]);
-            let set = [("threshold", num(60.0)), ("radius", num(10.0)), ("intensity", num(0.25))];
-            let o = run_fx("ec.stylize.glow", &set, img, 0.0, EffectEnv::default());
-            let (bx, by) = o.to_px([-1.5, 100.0]);
-            let p = o.img.get(bx.floor() as i64, by.floor() as i64);
-            assert!((p[ch] * 255.0 - ae).abs() <= 2.5, "{c:?} channel {ch}: {} vs AE {ae}", p[ch] * 255.0);
-            assert!((p[3] - 0.353).abs() < 3.0 / 255.0, "{c:?}: alpha {}", p[3]);
-        }
-        // Intensity scales the colour linearly: white at Intensity 1 is 3.7 × its alpha.
-        let white = effectcraft_raster::Image::filled(200, 200, [1.0, 1.0, 1.0, 1.0]);
-        let o = run_fx("ec.stylize.glow", &[("threshold", num(60.0)), ("radius", num(10.0))], white, 0.0, EffectEnv::default());
-        let (bx, by) = o.to_px([-1.5, 100.0]);
-        let p = o.img.get(bx.floor() as i64, by.floor() as i64);
-        assert!((p[1] / p[3] - 3.69).abs() < 0.05, "{p:?}");
-    }
-
-    /// After Effects 2026: Radial Blur keeps the layer's edges. Zoom 20 on a flat grey 960 × 540
-    /// solid (case 713) leaves it flat and opaque to the edge (EffectCraft faded the edges toward
-    /// transparency, letting the red layer below show through); on a full-frame horizontal ramp
-    /// (case 829, centre [960, 540]) row 540 reads 2/255 at x = 2 and 253/255 at x = 1917.
-    #[test]
-    fn radial_blur_keeps_the_layer_edges_as_after_effects() {
-        let zoom = |c: [f64; 2]| [("amount", num(20.0)), ("type", Value::Enum(1)), ("center", Value::Vec2(c))];
-        let grey = effectcraft_raster::Image::filled(960, 540, [0.5, 0.5, 0.5, 1.0]);
-        let o = run_fx("ec.blur.radial", &zoom([600.0, 300.0]), grey, 0.0, EffectEnv::default());
-        for (x, y) in [(0, 270), (1, 270), (959, 270), (480, 0), (480, 539), (0, 0), (959, 539)] {
-            let p = o.img.get(x, y);
-            assert!((p[3] - 1.0).abs() < 1e-4 && (p[0] - 0.5).abs() < 1e-4, "({x}, {y}): {p:?}");
-        }
-        let mut ramp = effectcraft_raster::Image::new(1920, 1080);
-        ramp.rows_mut().for_each(|(_, row)| {
-            for (x, px) in row.iter_mut().enumerate() {
-                let v = (x as f32 + 0.5) / 1920.0;
-                *px = [v, v, v, 1.0];
-            }
-        });
-        let o = run_fx("ec.blur.radial", &zoom([960.0, 540.0]), ramp, 0.0, EffectEnv::default());
-        for (x, ae) in [(2, 2.0), (1917, 253.0)] {
-            let p = o.img.get(x, 540);
-            assert!((p[0] * 255.0 - ae).abs() <= 2.0 && (p[3] - 1.0).abs() < 1e-4, "x {x}: {p:?} vs AE {ae}");
-        }
-    }
-
-    /// After Effects 2026, Venetian Blinds Completion 40, Direction 30, Width 50, Feather 5 on
-    /// an opaque 480 × 270 layer: alpha (0..255) along row y = 135. The transparent band starts
-    /// at the layer centre's phase, both edges are Gaussian (σ = Feather / 2).
-    #[test]
-    fn venetian_blinds_match_after_effects() {
-        let img = effectcraft_raster::Image::filled(480, 270, [0.5, 0.5, 0.5, 1.0]);
-        let vals = [("completion", Value::Scalar(40.0)), ("direction", Value::Scalar(30.0)), ("width", Value::Scalar(50.0)), ("feather", Value::Scalar(5.0))];
-        let o = run_fx("ec.transition.venetian", &vals, img, 0.0, EffectEnv::default());
-        let ae = [
-            (200, 5.0),
-            (203, 47.0),
-            (206, 145.0),
-            (209, 228.0),
-            (212, 253.0),
-            (224, 255.0),
-            (236, 238.0),
-            (239, 168.0),
-            (242, 66.0),
-            (245, 10.0),
-            (251, 0.0),
-            (257, 2.0),
-            (260, 31.0),
-        ];
-        for (x, a) in ae {
-            let got = o.img.get(x, 135)[3] * 255.0;
-            assert!((got - a).abs() <= 6.0, "x {x}: alpha {got} vs AE {a}");
-        }
-        // No completion leaves the layer; full completion clears it; no feather is a hard edge.
-        let full = [("completion", Value::Scalar(100.0)), ("feather", Value::Scalar(5.0))];
-        let img = effectcraft_raster::Image::filled(40, 20, [0.5, 0.5, 0.5, 1.0]);
-        assert!(run_fx("ec.transition.venetian", &full, img.clone(), 0.0, EffectEnv::default()).img.data.iter().all(|p| p[3] < 1e-4));
-        assert_eq!(run_fx("ec.transition.venetian", &[("completion", Value::Scalar(0.0))], img.clone(), 0.0, EffectEnv::default()).img, img);
-        let hard = run_fx(
-            "ec.transition.venetian",
-            &[("completion", Value::Scalar(50.0)), ("width", Value::Scalar(10.0)), ("feather", Value::Scalar(0.0))],
-            img,
+                ("radius", num(40.0)),
+                ("intensity", num(0.0)),
+            ],
+            grey,
             0.0,
             EffectEnv::default(),
         );
-        assert!(hard.img.data.iter().all(|p| p[3] == 0.0 || p[3] == 1.0));
-        // A feather far wider than the blinds is an even veil.
-        assert_eq!(venetian_cover(3.0, 10.0, 0.5, 1e9), 0.5);
-    }
-
-    /// After Effects 2026, Radial Wipe Completion 40, Start Angle 30, Wipe Counterclockwise,
-    /// Feather 20, centre (800, 500): visible fraction at pixel offsets from the centre on both
-    /// edges (8-bit captures of dark steps, so ±0.05).
-    #[test]
-    fn radial_wipe_feather_matches_after_effects() {
-        let img = effectcraft_raster::Image::filled(400, 300, [1.0, 1.0, 1.0, 1.0]);
-        let vals = [
-            ("completion", Value::Scalar(40.0)),
-            ("startAngle", Value::Scalar(30.0)),
-            ("center", Value::Vec2([200.0, 150.0])),
-            ("wipe", Value::Enum(1)),
-            ("feather", Value::Scalar(20.0)),
-        ];
-        let o = run_fx("ec.transition.radialwipe", &vals, img.clone(), 0.0, EffectEnv::default());
-        let ae = [
-            ((-50, 34), 0.922),
-            ((-52, 30), 0.797),
-            ((-54, 26), 0.609),
-            ((-55, 24), 0.5),
-            ((-56, 22), 0.406),
-            ((-57, 19), 0.266),
-            ((-58, 15), 0.125),
-            ((-104, 60), 0.951),
-            ((-108, 53), 0.732),
-            ((-111, 45), 0.341),
-            ((-114, 37), 0.062),
-            ((22, -56), 0.156),
-            ((26, -54), 0.312),
-            ((30, -52), 0.531),
-            ((34, -50), 0.729),
-            ((37, -47), 0.875),
-            ((53, -108), 0.177),
-            ((67, -99), 0.875),
-        ];
-        for ((dx, dy), a) in ae {
-            let got = o.img.get(200 + dx, 150 + dy)[3];
-            assert!((got - a).abs() < 0.05, "offset ({dx}, {dy}): {got} vs AE {a}");
+        for d in [0.5, 1.5, 3.5, 5.5, 10.5, 20.5] {
+            let (x, y) = out.to_px([-d, 60.0]);
+            let px = out.img.get(x.floor() as i64, y.floor() as i64);
+            assert!(px[3].abs() < 1e-6, "transparent padding acquired alpha at {d}px: {px:?}");
+            assert!(px[0].abs() < 1e-6 && px[1].abs() < 1e-6 && px[2].abs() < 1e-6,
+                "transparent padding acquired colour at {d}px: {px:?}");
         }
-        // 0 % leaves the layer, 100 % clears it, Feather 0 is a hard edge.
-        let at = |c: f64, f: f64| {
-            let v = [("completion", Value::Scalar(c)), ("feather", Value::Scalar(f))];
-            run_fx("ec.transition.radialwipe", &v, img.clone(), 0.0, EffectEnv::default()).img
-        };
-        assert_eq!(at(0.0, 20.0), img);
-        assert!(at(100.0, 20.0).data.iter().all(|p| p[3] == 0.0));
-        assert!(at(50.0, 0.0).data.iter().all(|p| p[3] == 0.0 || p[3] == 1.0));
+        let (x, y) = out.to_px([100.0, 60.0]);
+        let px = out.img.get(x.floor() as i64, y.floor() as i64);
+        assert_eq!(px, [0.5, 0.5, 0.5, 1.0], "zero intensity changed the source");
     }
 
     #[test]

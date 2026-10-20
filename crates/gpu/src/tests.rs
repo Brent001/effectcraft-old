@@ -951,14 +951,24 @@ fn shader_constants_match_the_cpu() {
     assert!(kernels.contains(&format!("powz(abs(c[i]), {gamma})")) && kernels.contains(&format!("1.0 / {gamma})"), "Exposure's power in kernels.wgsl is not {gamma}");
 }
 
-/// WGSL cannot read the CPU's constants, so Glow's bright pass repeats them as literals; this
-/// ties them to `effectcraft_effects::GLOW_GAIN` / `GLOW_KNEE` (runs without a GPU).
+/// Keep the GPU Glow bright pass and composite aligned with stable v0.11.1:
+/// thresholded alpha coverage and intensity must apply to the whole premultiplied RGBA value.
 #[test]
-fn glow_constants_match_the_cpu() {
-    use effectcraft_effects::{GLOW_GAIN, GLOW_KNEE};
+fn glow_kernel_uses_v0111_alpha_and_intensity_semantics() {
     let kernels = include_str!("shaders/kernels.wgsl");
-    let want = format!("max({GLOW_GAIN:?} * (px.xyz / a - vec3<f32>(thr - {GLOW_KNEE:?})), vec3<f32>(0.0))");
-    assert!(kernels.contains(&want), "Glow's bright pass in kernels.wgsl is not `{want}`");
+    assert!(
+        kernels.contains("textureStore(out, p, vec4<f32>(c * k * a, k * a));"),
+        "A & B Glow must threshold its alpha instead of covering the whole source alpha"
+    );
+    assert!(
+        kernels.contains("textureStore(out, p, px * k);"),
+        "Original-colour Glow must threshold the complete premultiplied source pixel"
+    );
+    assert!(
+        kernels.contains("let g = textureLoad(aux, p, 0) * P.f[0].x;"),
+        "Glow Intensity must scale premultiplied RGBA, including alpha"
+    );
+    assert!(!kernels.contains("var ga = a;"), "Glow must not add a radius-shaped alpha halo");
 }
 
 /// A layer whose bounds change every frame reads back at a new size each time: the staging

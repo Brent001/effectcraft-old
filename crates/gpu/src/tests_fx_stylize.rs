@@ -177,6 +177,10 @@ fn glow_operations_and_arbitrary_map() {
     effect_case("ec.stylize.glow", &[("glowOperation", e(3)), ("colors", e(1)), ("intensity", n(2.0))]);
     effect_case("ec.stylize.glow", &[("colors", e(2)), ("arbitraryMap", Value::Str("0,0 0.5,0.8 1,1|0,0.2 1,0.6|".into())), ("threshold", n(20.0))]);
     effect_case("ec.stylize.glow", &[("colors", e(2)), ("arbitraryMap", Value::Str("0,1 1,0||0,0 1,1".into())), ("operation", e(1)), ("glowOperation", e(4))]);
+    effect_case(
+        "ec.stylize.glow",
+        &[("based", e(1)), ("threshold", n(60.0)), ("radius", n(40.0)), ("intensity", n(0.0))],
+    );
 }
 
 /// Texturize with a texture layer (Tile / Center / Stretch), composited.
