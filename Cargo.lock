@@ -1188,7 +1188,8 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-aep"
-version = "0.12.1"[[package]]
+version = "0.12.1"
+[[package]]
 name = "effectcraft-aep-export"
 version = "0.12.1"
 dependencies = [
@@ -1714,7 +1715,8 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-vp9enc"
-version = "0.12.1"[[package]]
+version = "0.12.1"
+[[package]]
 name = "effectcraft-web"
 version = "0.12.1"
 dependencies = [
