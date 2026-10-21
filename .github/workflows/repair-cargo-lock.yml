@@ -1,6 +1,10 @@
 name: Repair Cargo.lock (CI only)
 
 on:
+  # Run automatically when this repair workflow itself is updated, and allow manual runs.
+  push:
+    paths:
+      - ".github/workflows/repair-cargo-lock.yml"
   workflow_dispatch:
     inputs:
       target_ref:
@@ -18,30 +22,29 @@ concurrency:
 
 jobs:
   refresh-lockfile:
-    name: Regenerate lockfile and verify Windows build
+    name: Regenerate lockfile and verify Windows targets
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - name: Check out requested revision
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.target_ref }}
+          ref: ${{ inputs.target_ref || github.ref_name }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Rust stable and Windows target
+      - name: Install Rust stable and all Windows targets
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc, i686-pc-windows-msvc, aarch64-pc-windows-msvc
 
       - name: Regenerate Cargo.lock
         shell: pwsh
         run: cargo generate-lockfile
 
-      - name: Verify Windows release dependencies with locked lockfile
-        shell: pwsh
-        run: cargo build --release --locked -p effectcraft -p effectcraft-cli --target x86_64-pc-windows-msvc
-
+      # Publish the generated lockfile to a separate branch before compiling. This means the
+      # repair branch remains available for review even if one architecture has an unrelated
+      # compiler or linker failure.
       - name: Create repair branch and commit lockfile
         id: commit
         shell: pwsh
@@ -63,10 +66,22 @@ jobs:
             git commit -m "ci: refresh Cargo.lock"
             if ($LASTEXITCODE -ne 0) { throw "Could not commit regenerated Cargo.lock" }
             git push origin "HEAD:refs/heads/$branch"
-            if ($LASTEXITCODE -ne 0) { throw "Could not push repair branch. Check Actions workflow permissions and branch rules." }
+            if ($LASTEXITCODE -ne 0) { throw "Could not push repair branch. Check Actions write permissions and branch rules." }
             "changed=true" >> $env:GITHUB_OUTPUT
             "branch=$branch" >> $env:GITHUB_OUTPUT
           }
+
+      - name: Verify x64 locked release build
+        shell: pwsh
+        run: cargo build --release --locked -p effectcraft -p effectcraft-cli --target x86_64-pc-windows-msvc
+
+      - name: Verify x86 locked release build
+        shell: pwsh
+        run: cargo build --release --locked -p effectcraft -p effectcraft-cli --target i686-pc-windows-msvc
+
+      - name: Verify ARM64 locked release build
+        shell: pwsh
+        run: cargo build --release --locked -p effectcraft -p effectcraft-cli --target aarch64-pc-windows-msvc
 
       - name: Report repair branch
         if: always()
@@ -77,4 +92,5 @@ jobs:
         run: |
           "Repair branch: $env:BRANCH" >> $env:GITHUB_STEP_SUMMARY
           "Cargo.lock changed: $env:CHANGED" >> $env:GITHUB_STEP_SUMMARY
-          "The lockfile is pushed to a separate branch only after the Windows locked build succeeds. Review and merge that branch."
+          "Repair branch: https://github.com/Brent001/effectcraft/tree/$env:BRANCH" >> $env:GITHUB_STEP_SUMMARY
+          "Merge the repair branch only after reviewing the lockfile diff and successful builds." >> $env:GITHUB_STEP_SUMMARY
