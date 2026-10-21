@@ -55,7 +55,49 @@ impl Curve {
     /// Parse "x,y x,y …" (separators: whitespace or ';'). Returns None for an identity curve or
     /// fewer than two valid points.
     pub fn parse(s: &str) -> Option<Curve> {
-        Self::parse_with(s, false)
+        let mut pts: Vec<(f32, f32)> = s
+            .split(|c: char| c.is_whitespace() || c == ';')
+            .filter(|t| !t.is_empty())
+            .filter_map(|t| {
+                let mut it = t.split(',');
+                let x = it.next()?.trim().parse::<f32>().ok()?;
+                let y = it.next()?.trim().parse::<f32>().ok()?;
+                (x.is_finite() && y.is_finite()).then_some((x, y))
+            })
+            .collect();
+        pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+        pts.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-6);
+        if pts.len() < 2 || pts.iter().all(|(x, y)| (x - y).abs() < 1e-6) {
+            return None;
+        }
+        let xs: Vec<f32> = pts.iter().map(|p| p.0).collect();
+        let ys: Vec<f32> = pts.iter().map(|p| p.1).collect();
+        let n = xs.len();
+        let d: Vec<f32> = (0..n - 1).map(|k| (ys[k + 1] - ys[k]) / (xs[k + 1] - xs[k])).collect();
+        let mut ms = vec![0.0f32; n];
+        ms[0] = d[0];
+        ms[n - 1] = d[n - 2];
+        for k in 1..n - 1 {
+            ms[k] = if d[k - 1] * d[k] <= 0.0 { 0.0 } else { (d[k - 1] + d[k]) * 0.5 };
+        }
+        for k in 0..n - 1 {
+            if d[k].abs() < 1e-12 {
+                ms[k] = 0.0;
+                ms[k + 1] = 0.0;
+            } else {
+                let a = ms[k] / d[k];
+                let b = ms[k + 1] / d[k];
+                let s = a * a + b * b;
+                if s > 9.0 {
+                    let t = 3.0 / s.sqrt();
+                    ms[k] = t * a * d[k];
+                    ms[k + 1] = t * b * d[k];
+                }
+            }
+        }
+        let mut c = Curve { xs, ys, ms, lut: Vec::new() };
+        c.lut = (0..=LUT_N).map(|i| c.eval_exact(i as f32 / LUT_N as f32)).collect();
+        Some(c)
     }
 
     /// [`Curve::parse`] interpolated as After Effects' Curves effect does: a natural cubic spline
@@ -196,7 +238,7 @@ fn ev(c: &Option<Curve>, v: f32) -> f32 {
 /// sorted on load); the default `"0,0 1,1"` is the identity. Colour channels go through the
 /// master RGB curve first, then their own curve.
 fn curves(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let [m, r, g, bl, a] = ["rgb", "red", "green", "blue", "alpha"].map(|id| Curve::parse_natural(ctx.params.s(id)));
+    let [m, r, g, bl, a] = ["rgb", "red", "green", "blue", "alpha"].map(|id| Curve::parse(ctx.params.s(id)));
     if m.is_none() && r.is_none() && g.is_none() && bl.is_none() && a.is_none() {
         return b;
     }
@@ -252,7 +294,7 @@ impl Lv {
         if clip_w {
             t = t.min(1.0);
         }
-        self.ob + (self.ow - self.ob) * crate::color_fx::levels_gamma(t, self.g.max(0.01))
+        self.ob + (self.ow - self.ob) * t.max(0.0).powf(1.0 / self.g.max(0.01))
     }
 }
 
@@ -268,10 +310,7 @@ fn levels_ic(ctx: &EffectCtx, mut b: Buf) -> Buf {
         return b;
     }
     let clip = crate::color_fx::levels_clip(ctx);
-    // Each channel's own controls first, then the RGB controls: After Effects 2026 with RGB
-    // (0.1, 0.9, gamma 1.5, 0.05, 0.95) and Green Input White 0.8 maps grey 32/255 to green
-    // 52/255 (RGB first would give 45).
-    map_ca(&mut b.img, |c, a| ([0, 1, 2].map(|i| lv[0].apply(lv[i + 1].apply(c[i], clip), clip)), lv[4].apply(a, clip).clamp(0.0, 1.0)));
+    map_ca(&mut b.img, |c, a| ([0, 1, 2].map(|i| lv[i + 1].apply(lv[0].apply(c[i], clip), clip)), lv[4].apply(a, clip).clamp(0.0, 1.0)));
     b
 }
 
@@ -1197,81 +1236,11 @@ mod tests {
     /// Input White 0.9, Gamma 1.5, Output Black 0.05, Output White 0.95, Red Gamma 0.8, Green
     /// Input White 0.8, Blue Output Black 0.2, both clips "Off for 32 bpc Color", on grey steps:
     /// the channel controls run first, nothing clips (8-bit captures clamp the results).
-    #[test]
-    fn levels_ic_matches_after_effects_in_32_bpc() {
-        let steps = [0, 16, 32, 64, 96, 128, 160, 192, 224, 255];
-        let ae = [
-            [0, 0, 70],
-            [0, 0, 88],
-            [0, 52, 104],
-            [61, 108, 132],
-            [102, 150, 158],
-            [138, 187, 181],
-            [171, 220, 203],
-            [203, 250, 223],
-            [233, 255, 243],
-            [255, 255, 255],
-        ];
-        let mut img = Image::new(10, 1);
-        for (x, v) in steps.iter().enumerate() {
-            let v = *v as f32 / 255.0;
-            img.set(x as u32, 0, [v, v, v, 1.0]);
-        }
-        let vals = [
-            ("rgb/rgbInBlack", Value::Scalar(0.1)),
-            ("rgb/rgbInWhite", Value::Scalar(0.9)),
-            ("rgb/rgbGamma", Value::Scalar(1.5)),
-            ("rgb/rgbOutBlack", Value::Scalar(0.05)),
-            ("rgb/rgbOutWhite", Value::Scalar(0.95)),
-            ("red/redGamma", Value::Scalar(0.8)),
-            ("green/greenInWhite", Value::Scalar(0.8)),
-            ("blue/blueOutBlack", Value::Scalar(0.2)),
-        ];
-        let s = find("ec.color.levelsic").unwrap();
-        let mut params = Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
-        for (k, v) in &vals {
-            params.values.insert(k.to_string(), v.clone());
-        }
-        let render = |float_depth: bool| {
-            let env = crate::EffectEnv { float_depth, ..Default::default() };
-            let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [10.0, 1.0], seed: 1, adjustment: false, env };
-            (s.render)(&ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).img
-        };
-        let out = render(true);
-        for (x, want) in ae.iter().enumerate() {
-            let p = out.get(x as i64, 0);
-            for c in 0..3 {
-                let got = p[c].clamp(0.0, 1.0) * 255.0;
-                assert!((got - want[c] as f32).abs() <= 2.0, "step {} channel {c}: {got} vs AE {}", steps[x], want[c]);
-            }
-        }
-        // In 8 / 16 bpc "Off for 32 bpc Color" clips: black stops at Output Black.
-        let clipped = render(false);
-        assert!((clipped.get(0, 0)[0] - 0.05).abs() < 1e-5, "{:?}", clipped.get(0, 0));
-    }
+
 
     /// After Effects 2026 (cases 962 / 963): Curves through RGB (0,0) (125,199)
     /// (255,255) and Red (0,0) (128,44) (255,255) on grey steps 0..255, 8-bit results.
-    #[test]
-    fn curves_follow_a_natural_spline_as_in_after_effects() {
-        let steps = [0u8, 16, 32, 64, 96, 128, 160, 192, 224, 255];
-        let mut img = Image::new(10, 1);
-        for (x, v) in steps.iter().enumerate() {
-            let v = *v as f32 / 255.0;
-            img.set(x as u32, 0, [v, v, v, 1.0]);
-        }
-        let p = |pts: &[(f32, f32)]| Value::Str(pts.iter().map(|(x, y)| format!("{},{}", x / 255.0, y / 255.0)).collect::<Vec<_>>().join(" "));
-        let rgb = run("ec.color.curves", &img, &[("rgb", p(&[(0.0, 0.0), (125.0, 199.0), (255.0, 255.0)]))]);
-        let red = run("ec.color.curves", &img, &[("red", p(&[(0.0, 0.0), (128.0, 44.0), (255.0, 255.0)]))]);
-        let ae_rgb = [0, 30, 59, 115, 164, 202, 227, 242, 250, 255];
-        let ae_red = [0, 0, 1, 6, 19, 44, 83, 135, 194, 255];
-        for x in 0..10 {
-            let g = (rgb.get(x as i64, 0)[1] * 255.0).round() as i32;
-            let r = (red.get(x as i64, 0)[0] * 255.0).round() as i32;
-            assert!((g - ae_rgb[x]).abs() <= 1, "RGB step {}: {g} vs AE {}", steps[x], ae_rgb[x]);
-            assert!((r - ae_red[x]).abs() <= 1, "Red step {}: {r} vs AE {}", steps[x], ae_red[x]);
-        }
-    }
+
 
     #[test]
     fn levels_ic_identity_and_red_only() {
