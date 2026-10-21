@@ -168,10 +168,21 @@ fn compare(s: &Scene, o: RenderOpts) -> Option<crate::tests::Diff> {
     let mut r = Renderer::new(&s.p, &AuxSource, RenderOpts { backend: Backend::Gpu, ..o });
     r.accel = Some(g);
     let img = g.render(&r, s.cid, Tick::ZERO).unwrap_or_else(|| {
+        // Re-run the low-level walk to distinguish a compositor decline from readback failure.
+        let (walk_succeeded, missing, core_missing) = {
+            let mut enc = crate::context::Enc::new(g.context());
+            let rendered = crate::walk::render(&mut enc, &r, s.cid, Tick::ZERO);
+            (rendered.is_some(), enc.take_missing(), enc.take_core_missing())
+        };
         panic!(
-            "the GPU renders the frame; unavailable kernels: {:?}; device health: {:?}",
-            g.context().unavailable_kernels(),
-            g.context().check_health()
+            "GPU frame declined: walk_succeeded={}, missing_kernel={}, core_kernel_missing={}, can_readback={}, can_wait={}, device_health={:?}, unavailable_kernels={:?}",
+            walk_succeeded,
+            missing,
+            core_missing,
+            g.context().can_readback(),
+            g.context().can_wait(),
+            g.context().check_health(),
+            g.context().unavailable_kernels()
         )
     });
     let mut d = diff(&cpu, &img, tolerance(s.p.settings.bit_depth));
