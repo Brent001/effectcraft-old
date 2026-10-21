@@ -438,6 +438,12 @@ fn layer_styles_collapsed_precomps_and_cpu_fallbacks() {
 /// The effect alone on a buffer: GPU kernels vs the CPU effect (32-bit float), including the
 /// buffer geometry (padding, offset).
 pub(crate) fn effect_direct(id: &str, vals: &[(&str, Value)], adjustment: bool) {
+    // Some effect IDs temporarily use the official CPU reference because the fork's
+    // modified shader has not yet passed stable-version parity. Their composited scene
+    // comparison still runs in effect_case; don't insist on a direct GPU kernel here.
+    if !crate::effects::supports(id) {
+        return;
+    }
     let Some(g) = gpu() else { return };
     let spec = effectcraft_effects::find(id).unwrap();
     let size = [70.0, 44.0];
