@@ -2,13 +2,12 @@
 //! matte clean-up. Written from public behaviour descriptions and the standard colour-difference /
 //! blue-screen matting literature (Vlahos; Smith & Blinn, "Blue Screen Matting").
 
-use effectcraft_color::{rgb_to_hsl, srgb_to_linear};
+use effectcraft_color::{luminance, rgb_to_hsl, srgb_to_linear};
 use effectcraft_keyframe::Value;
 use effectcraft_project::ParamUi;
 use effectcraft_raster::{Image, gaussian_blur};
 use rayon::prelude::*;
 
-use crate::color_fx::luma_601;
 use crate::util::{Plane, gauss_plane, morph_frac, premul, unpremul};
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 
