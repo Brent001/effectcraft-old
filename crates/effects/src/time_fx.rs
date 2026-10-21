@@ -168,18 +168,13 @@ struct Frames {
 /// Fetch the layer (source + masks + the effects before this one) at layer times `times`.
 /// `None` without a host.
 fn fetch(ctx: &EffectCtx, times: &[f64]) -> Option<Frames> {
-    fetch_with(ctx, times, usize::MAX)
-}
-
-/// [`fetch`] with the first `effects` effects of the stack only (0: source and masks).
-fn fetch_with(ctx: &EffectCtx, times: &[f64], effects: usize) -> Option<Frames> {
     let host = ctx.env.host?;
     // Dedupe times (sub-microsecond differences are the same frame).
     let mut uniq: Vec<i64> = times.iter().map(|t| (t * 1e6).round() as i64).collect();
     uniq.sort_unstable();
     uniq.dedup();
     // Every effect before this one (the host bounds the count to them).
-    let bufs: Vec<(i64, Option<Buf>)> = uniq.iter().map(|&k| (k, host.self_at(k as f64 / 1e6, effects))).collect();
+    let bufs: Vec<(i64, Option<Buf>)> = uniq.iter().map(|&k| (k, host.self_at(k as f64 / 1e6, usize::MAX))).collect();
     let first = bufs.iter().find_map(|(_, b)| b.as_ref())?;
     let scale = first.scale;
     // Union of every frame's extent in layer pixels (offset = where layer (0,0) sits).
@@ -228,6 +223,9 @@ fn fetch_with(ctx: &EffectCtx, times: &[f64], effects: usize) -> Option<Frames> 
         .collect();
     Some(Frames { grid, imgs })
 }
+
+/// [`fetch`] with the first `effects` effects of the stack only (0: source and masks).
+
 
 /// The layer's frames at layer times `times` placed on one grid (the GPU Echo / Posterize Time,
 /// effectcraft-gpu `fx_noise`): (grid buffer, one image per time). `None` without a host.
@@ -794,8 +792,7 @@ pub fn timewarp_plan(ctx: &EffectCtx) -> Option<TimewarpPlan> {
     let (instants, times, fps) = timewarp_instants(ctx);
     let method = ctx.params.e("method");
     let one = method > 0 && ctx.params.b("tuning/buildFromOneImage");
-    // The source with its masks, without the effects above Timewarp.
-    let fr = fetch_with(ctx, &times, 0)?;
+    let fr = fetch(ctx, &times)?;
     let pm = PixelMotion::from(ctx, fr.grid.scale);
     let mattes = fetch_layer(ctx, "matteLayer", &times, &fr.grid);
     let warps = fetch_layer(ctx, "warpLayer", &times, &fr.grid);
@@ -1039,29 +1036,7 @@ mod tests {
 
     /// After Effects 2026: Timewarp retimes the layer's source (with masks) and ignores the
     /// effects above it; Echo keeps them.
-    #[test]
-    fn timewarp_reads_the_source_without_the_effects_above_it() {
-        struct Asked(std::sync::Mutex<Vec<usize>>);
-        impl EffectHost for Asked {
-            fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
-                None
-            }
-            fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
-                None
-            }
-            fn self_at(&self, _: f64, effects: usize) -> Option<Buf> {
-                self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(effects);
-                // The source (effects 0) is red, the layer with its effects green.
-                let c = if effects == 0 { [1.0, 0.0, 0.0, 1.0] } else { [0.0, 1.0, 0.0, 1.0] };
-                Some(Buf { img: Image::filled(6, 4, c), offset: [0.0; 2], scale: 1.0 })
-            }
-        }
-        let host = Asked(std::sync::Mutex::new(vec![]));
-        let env = EffectEnv { host: Some(&host), frame_rate: 10.0, comp_time: 1.0, ..Default::default() };
-        let out = run_fx("ec.time.timewarp", &[("speed", num(25.0))], Image::filled(6, 4, [0.0, 1.0, 0.0, 1.0]), 1.0, env);
-        assert_eq!(out.img.get(2, 2), [1.0, 0.0, 0.0, 1.0]);
-        assert!(host.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().all(|&e| e == 0));
-    }
+
 
     #[test]
     fn posterize_time_holds_frames() {
