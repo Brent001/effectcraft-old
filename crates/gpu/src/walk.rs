@@ -93,9 +93,21 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
             draw_3d(e, r, ctx, &visible[i..j], canvas)?;
             i = j;
         } else {
-            match r.collapsed(ctx, visible[i]) {
-                Some(item) => draw_collapsed(e, r, ctx, visible[i], item, canvas)?,
-                None => draw_layer(e, r, ctx, visible[i], canvas)?,
+            let layer = visible[i];
+            let drawn = match r.collapsed(ctx, layer) {
+                Some(item) => draw_collapsed(e, r, ctx, layer, item, canvas),
+                None => draw_layer(e, r, ctx, layer, canvas),
+            };
+            if drawn.is_none() {
+                log::error!(
+                    target: "effectcraft_gpu",
+                    "GPU compositor declined while drawing layer {} (3D={}, adjustment={}, effects={})",
+                    layer.id.0,
+                    layer.is_3d(),
+                    layer.switches.adjustment,
+                    layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty())
+                );
+                return None;
             }
             i += 1;
         }
