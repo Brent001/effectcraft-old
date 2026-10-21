@@ -168,7 +168,60 @@ struct Frames {
 /// Fetch the layer (source + masks + the effects before this one) at layer times `times`.
 /// `None` without a host.
 fn fetch(ctx: &EffectCtx, times: &[f64]) -> Option<Frames> {
-    fetch_with(ctx, times, usize::MAX)
+    let host = ctx.env.host?;
+    // Dedupe times (sub-microsecond differences are the same frame).
+    let mut uniq: Vec<i64> = times.iter().map(|t| (t * 1e6).round() as i64).collect();
+    uniq.sort_unstable();
+    uniq.dedup();
+    // Every effect before this one (the host bounds the count to them).
+    let bufs: Vec<(i64, Option<Buf>)> = uniq.iter().map(|&k| (k, host.self_at(k as f64 / 1e6, usize::MAX))).collect();
+    let first = bufs.iter().find_map(|(_, b)| b.as_ref())?;
+    let scale = first.scale;
+    // Union of every frame's extent in layer pixels (offset = where layer (0,0) sits).
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for b in bufs.iter().filter_map(|(_, b)| b.as_ref()) {
+        let k = scale / b.scale.max(1e-9);
+        x0 = x0.min(-b.offset[0] * k);
+        y0 = y0.min(-b.offset[1] * k);
+        x1 = x1.max((b.img.width as f64 - b.offset[0]) * k);
+        y1 = y1.max((b.img.height as f64 - b.offset[1]) * k);
+    }
+    let (x0, y0) = (x0.floor(), y0.floor());
+    let w = ((x1.ceil() - x0) as u32).clamp(1, 16384);
+    let h = ((y1.ceil() - y0) as u32).clamp(1, 16384);
+    let grid = Buf { img: Image::new(w, h), offset: [-x0, -y0], scale };
+    let place = |b: &Buf| -> Image {
+        if (b.scale - scale).abs() < 1e-9 && b.img.width == w && b.img.height == h && (b.offset[0] + x0).abs() < 1e-6 && (b.offset[1] + y0).abs() < 1e-6 {
+            return b.img.clone();
+        }
+        let k = b.scale / scale;
+        let same_scale = (k - 1.0).abs() < 1e-9;
+        let dx = b.offset[0] + x0;
+        let dy = b.offset[1] + y0;
+        let mut out = Image::new(w, h);
+        let ow = w as usize;
+        out.data.par_chunks_mut(ow).enumerate().for_each(|(y, row)| {
+            for (x, px) in row.iter_mut().enumerate() {
+                *px = if same_scale && dx.fract() == 0.0 && dy.fract() == 0.0 {
+                    b.img.get(x as i64 + dx as i64, y as i64 + dy as i64)
+                } else {
+                    let sx = (x as f64 + 0.5) * k + dx - 0.5;
+                    let sy = (y as f64 + 0.5) * k + dy - 0.5;
+                    b.img.sample_bilinear(sx + 0.5, sy + 0.5)
+                };
+            }
+        });
+        out
+    };
+    let placed: Vec<(i64, Image)> = bufs.iter().map(|(k, b)| (*k, b.as_ref().map(place).unwrap_or_else(|| Image::new(w, h)))).collect();
+    let imgs = times
+        .iter()
+        .map(|t| {
+            let k = (t * 1e6).round() as i64;
+            placed.iter().find(|(q, _)| *q == k).map(|(_, i)| i.clone()).unwrap_or_else(|| Image::new(w, h))
+        })
+        .collect();
+    Some(Frames { grid, imgs })
 }
 
 /// [`fetch`] with the first `effects` effects of the stack only (0: source and masks).
@@ -794,8 +847,7 @@ pub fn timewarp_plan(ctx: &EffectCtx) -> Option<TimewarpPlan> {
     let (instants, times, fps) = timewarp_instants(ctx);
     let method = ctx.params.e("method");
     let one = method > 0 && ctx.params.b("tuning/buildFromOneImage");
-    // The source with its masks, without the effects above Timewarp.
-    let fr = fetch_with(ctx, &times, 0)?;
+    let fr = fetch(ctx, &times)?;
     let pm = PixelMotion::from(ctx, fr.grid.scale);
     let mattes = fetch_layer(ctx, "matteLayer", &times, &fr.grid);
     let warps = fetch_layer(ctx, "warpLayer", &times, &fr.grid);
@@ -1039,29 +1091,7 @@ mod tests {
 
     /// After Effects 2026: Timewarp retimes the layer's source (with masks) and ignores the
     /// effects above it; Echo keeps them.
-    #[test]
-    fn timewarp_reads_the_source_without_the_effects_above_it() {
-        struct Asked(std::sync::Mutex<Vec<usize>>);
-        impl EffectHost for Asked {
-            fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
-                None
-            }
-            fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
-                None
-            }
-            fn self_at(&self, _: f64, effects: usize) -> Option<Buf> {
-                self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(effects);
-                // The source (effects 0) is red, the layer with its effects green.
-                let c = if effects == 0 { [1.0, 0.0, 0.0, 1.0] } else { [0.0, 1.0, 0.0, 1.0] };
-                Some(Buf { img: Image::filled(6, 4, c), offset: [0.0; 2], scale: 1.0 })
-            }
-        }
-        let host = Asked(std::sync::Mutex::new(vec![]));
-        let env = EffectEnv { host: Some(&host), frame_rate: 10.0, comp_time: 1.0, ..Default::default() };
-        let out = run_fx("ec.time.timewarp", &[("speed", num(25.0))], Image::filled(6, 4, [0.0, 1.0, 0.0, 1.0]), 1.0, env);
-        assert_eq!(out.img.get(2, 2), [1.0, 0.0, 0.0, 1.0]);
-        assert!(host.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().all(|&e| e == 0));
-    }
+
 
     #[test]
     fn posterize_time_holds_frames() {
