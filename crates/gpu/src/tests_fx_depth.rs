@@ -167,7 +167,13 @@ fn compare(s: &Scene, o: RenderOpts) -> Option<crate::tests::Diff> {
     let cpu = Renderer::new(&s.p, &AuxSource, RenderOpts { backend: Backend::Cpu, ..o }).comp_frame_cpu(s.cid, Tick::ZERO);
     let mut r = Renderer::new(&s.p, &AuxSource, RenderOpts { backend: Backend::Gpu, ..o });
     r.accel = Some(g);
-    let img = g.render(&r, s.cid, Tick::ZERO).expect("the GPU renders the frame");
+    let img = g.render(&r, s.cid, Tick::ZERO).unwrap_or_else(|| {
+        panic!(
+            "the GPU renders the frame; unavailable kernels: {:?}; device health: {:?}",
+            g.context().unavailable_kernels(),
+            g.context().check_health()
+        )
+    });
     let mut d = diff(&cpu, &img, tolerance(s.p.settings.bit_depth));
     d.quantized = s.p.settings.bit_depth != BitDepth::Bpc32;
     Some(d)
