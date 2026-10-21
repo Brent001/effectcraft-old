@@ -170,25 +170,36 @@ fn compare(s: &Scene, o: RenderOpts) -> Option<crate::tests::Diff> {
     let img = match g.render(&r, s.cid, Tick::ZERO) {
         Some(img) => img,
         None => {
-            // Re-run the low-level walk to distinguish an ordinary compositor decline from
-            // a shader or device failure. GPU rendering explicitly permits CPU fallback.
-            let (walk_succeeded, missing, core_missing) = {
-                let mut enc = crate::context::Enc::new(g.context());
-                let rendered = crate::walk::render(&mut enc, &r, s.cid, Tick::ZERO);
-                (rendered.is_some(), enc.take_missing(), enc.take_core_missing())
-            };
             let health = g.context().check_health();
             let can_readback = g.context().can_readback();
             let can_wait = g.context().can_wait();
 
-            // Windows hosted runners often expose only the Microsoft software adapter.
-            // The full compositor may decline a particular layer there even when the
-            // standalone effect kernel passes its direct CPU/GPU parity tests. Verify the
-            // renderer's documented CPU fallback on healthy software adapters, but do not
-            // mask missing kernels, device faults, or failures on hardware GPUs.
-            if g.context().software && health.is_ok() && can_readback && can_wait && !missing && !core_missing {
+            // Diagnose the walk only while the device is still healthy. Do not submit more GPU
+            // work after a readback timeout has already marked the device unhealthy.
+            let (walk_succeeded, missing, core_missing) = if health.is_ok() {
+                let mut enc = crate::context::Enc::new(g.context());
+                let rendered = crate::walk::render(&mut enc, &r, s.cid, Tick::ZERO);
+                (rendered.is_some(), enc.take_missing(), enc.take_core_missing())
+            } else {
+                (false, false, false)
+            };
+
+            // The Windows hosted runner exposes Microsoft Basic Render Driver (WARP). Full-frame
+            // composition with auxiliary channels can exceed the GPU readback's 10-second safety
+            // deadline on WARP, marking that software device unhealthy. This is an expected
+            // software-runner limitation, not evidence that the standalone Cryptomatte shader
+            // is wrong: direct GPU-vs-CPU effect parity is tested above. Verify the normal
+            // renderer fallback only for that exact timeout; other declines stay failures.
+            let software_readback_timeout = g.context().software
+                && !can_readback
+                && !can_wait
+                && health.as_ref().err().is_some_and(|error| {
+                    error.contains("GPU readback poll")
+                        && error.contains("Wait timed out before the submission was completed")
+                });
+            if software_readback_timeout && !missing && !core_missing {
                 eprintln!(
-                    "GPU compositor declined this scene on a software adapter (walk_succeeded={walk_succeeded}); verifying CPU fallback."
+                    "WARP exceeded the GPU readback deadline for full-frame Cryptomatte composition; verifying the documented CPU fallback."
                 );
                 let fallback = r.comp_frame(s.cid, Tick::ZERO);
                 let mut d = diff(&cpu, &fallback, tolerance(s.p.settings.bit_depth));
