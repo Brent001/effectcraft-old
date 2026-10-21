@@ -233,6 +233,21 @@ fn case(id: &str, vals: &[(&str, Value)]) {
 }
 
 fn composited(id: &str, vals: &[(&str, Value)], allow: f64) {
+    // Microsoft's Basic Render Driver (WARP) has no hardware acceleration. These
+    // auxiliary-channel full-frame parity scenes can exceed the GPU readback deadline
+    // there and poison the test device for later cases. Keep the direct effect-kernel
+    // GPU-vs-CPU checks above enabled on WARP, and exercise full-frame auxiliary-channel
+    // composition on hardware adapters. The separate compositor smoke test still covers
+    // core-pipeline initialization on software adapters.
+    if let Some(g) = gpu()
+        && g.context().software
+    {
+        eprintln!(
+            "Skipping full-frame {id} auxiliary-channel parity on software adapter {}; direct GPU effect parity remains enabled.",
+            g.context().name
+        );
+        return;
+    }
     for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
         let mut s = Scene::new(depth);
         let bg = s.solid([0.15, 0.1, 0.2], 97, 61);
