@@ -239,7 +239,7 @@ impl Fractal {
             overflow: pr.e("overflow"),
             invert: pr.b("invert"),
             rot: rot.sin_cos(),
-            size: [(sw * NOISE_CELL * b.scale).max(1.0) as f32, (sh * NOISE_CELL * b.scale).max(1.0) as f32],
+            size: [(sw * b.scale).max(1.0) as f32, (sh * b.scale).max(1.0) as f32],
             origin: [ox as f32, oy as f32],
             center: [cx as f32, cy as f32],
             perspective: pr.b("transform/perspectiveOffset"),
