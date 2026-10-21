@@ -900,6 +900,9 @@ fn nested_group<'a>(g: &'a mut PropGroup, ids: &mut Ids, path: &str) -> Option<&
 /// Effects the GPU compositor (`effectcraft-gpu`) implements with the CPU effect's semantics
 /// (Mercury GPU Acceleration; the Effects & Presets GPU badge). Expression controls are
 /// pass-throughs and count as GPU effects too.
+///
+/// Effects whose fork-specific GPU kernels diverged from the official stable renderer are
+/// deliberately omitted until GPU parity tests pass; those effects continue to use the CPU reference.
 pub const GPU_EFFECTS: &[&str] = &[
     "ec.blur.gaussian",
     "ec.blur.fastbox",
