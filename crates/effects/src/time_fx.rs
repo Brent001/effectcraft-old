@@ -225,62 +225,7 @@ fn fetch(ctx: &EffectCtx, times: &[f64]) -> Option<Frames> {
 }
 
 /// [`fetch`] with the first `effects` effects of the stack only (0: source and masks).
-fn fetch_with(ctx: &EffectCtx, times: &[f64], effects: usize) -> Option<Frames> {
-    let host = ctx.env.host?;
-    // Dedupe times (sub-microsecond differences are the same frame).
-    let mut uniq: Vec<i64> = times.iter().map(|t| (t * 1e6).round() as i64).collect();
-    uniq.sort_unstable();
-    uniq.dedup();
-    // Every effect before this one (the host bounds the count to them).
-    let bufs: Vec<(i64, Option<Buf>)> = uniq.iter().map(|&k| (k, host.self_at(k as f64 / 1e6, effects))).collect();
-    let first = bufs.iter().find_map(|(_, b)| b.as_ref())?;
-    let scale = first.scale;
-    // Union of every frame's extent in layer pixels (offset = where layer (0,0) sits).
-    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-    for b in bufs.iter().filter_map(|(_, b)| b.as_ref()) {
-        let k = scale / b.scale.max(1e-9);
-        x0 = x0.min(-b.offset[0] * k);
-        y0 = y0.min(-b.offset[1] * k);
-        x1 = x1.max((b.img.width as f64 - b.offset[0]) * k);
-        y1 = y1.max((b.img.height as f64 - b.offset[1]) * k);
-    }
-    let (x0, y0) = (x0.floor(), y0.floor());
-    let w = ((x1.ceil() - x0) as u32).clamp(1, 16384);
-    let h = ((y1.ceil() - y0) as u32).clamp(1, 16384);
-    let grid = Buf { img: Image::new(w, h), offset: [-x0, -y0], scale };
-    let place = |b: &Buf| -> Image {
-        if (b.scale - scale).abs() < 1e-9 && b.img.width == w && b.img.height == h && (b.offset[0] + x0).abs() < 1e-6 && (b.offset[1] + y0).abs() < 1e-6 {
-            return b.img.clone();
-        }
-        let k = b.scale / scale;
-        let same_scale = (k - 1.0).abs() < 1e-9;
-        let dx = b.offset[0] + x0;
-        let dy = b.offset[1] + y0;
-        let mut out = Image::new(w, h);
-        let ow = w as usize;
-        out.data.par_chunks_mut(ow).enumerate().for_each(|(y, row)| {
-            for (x, px) in row.iter_mut().enumerate() {
-                *px = if same_scale && dx.fract() == 0.0 && dy.fract() == 0.0 {
-                    b.img.get(x as i64 + dx as i64, y as i64 + dy as i64)
-                } else {
-                    let sx = (x as f64 + 0.5) * k + dx - 0.5;
-                    let sy = (y as f64 + 0.5) * k + dy - 0.5;
-                    b.img.sample_bilinear(sx + 0.5, sy + 0.5)
-                };
-            }
-        });
-        out
-    };
-    let placed: Vec<(i64, Image)> = bufs.iter().map(|(k, b)| (*k, b.as_ref().map(place).unwrap_or_else(|| Image::new(w, h)))).collect();
-    let imgs = times
-        .iter()
-        .map(|t| {
-            let k = (t * 1e6).round() as i64;
-            placed.iter().find(|(q, _)| *q == k).map(|(_, i)| i.clone()).unwrap_or_else(|| Image::new(w, h))
-        })
-        .collect();
-    Some(Frames { grid, imgs })
-}
+
 
 /// The layer's frames at layer times `times` placed on one grid (the GPU Echo / Posterize Time,
 /// effectcraft-gpu `fx_noise`): (grid buffer, one image per time). `None` without a host.
