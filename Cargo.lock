@@ -1189,6 +1189,7 @@ dependencies = [
 [[package]]
 name = "effectcraft-aep"
 version = "0.12.1"
+
 [[package]]
 name = "effectcraft-aep-export"
 version = "0.12.1"
@@ -1716,6 +1717,7 @@ dependencies = [
 [[package]]
 name = "effectcraft-vp9enc"
 version = "0.12.1"
+
 [[package]]
 name = "effectcraft-web"
 version = "0.12.1"
@@ -6705,7 +6707,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "serde_json",
 ]
